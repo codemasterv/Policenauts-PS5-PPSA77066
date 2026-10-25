@@ -2,7 +2,7 @@
 
 A native PlayStation 5 build of *Policenauts* (Konami, 1996, PS1): the Japanese release (SLPS-00215/00216) with Slowbeef's English patch v1.0. It installs as a home-screen title on a jailbroken PS5 through ShadowMountPlus.
 
-> **Personal use only.** The engine is PolyForm Noncommercial 1.0.0, and `policenauts_recomp/generated/` is C translated from your own disc. Don't publish builds or this source. Disc images aren't included.
+> **Personal use only.** The engine is PolyForm Noncommercial 1.0.0, and `policenauts_recomp/generated/` is C translated from your own disc. 
 
 ## What it is
 
