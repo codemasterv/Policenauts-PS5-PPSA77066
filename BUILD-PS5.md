@@ -1,8 +1,7 @@
 # Policenauts — PS5 native title (PPSA77066), source
 
 Personal use only. The engine (psxrecomp) is PolyForm Noncommercial 1.0.0, and
-`policenauts_recomp/generated/` is C translated from your own disc. Don't
-publish this package. Your disc images are not in it.
+`policenauts_recomp/generated/` is C translated from your own disc. 
 
 ## What's in here
 
