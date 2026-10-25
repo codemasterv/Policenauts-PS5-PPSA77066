@@ -1,0 +1,1640 @@
+diff --git a/runtime/runtime.cmake b/runtime/runtime.cmake
+index 6469610..a605b7f 100644
+--- a/runtime/runtime.cmake
++++ b/runtime/runtime.cmake
+@@ -1593,6 +1593,15 @@ function(psxrecomp_add_runtime_target target)
+         )
+     endif()
+     target_link_libraries(${target} PRIVATE chdr-static)
++    if(PROSPERO)
++        # PS5 homebrew (ps5-payload-sdk toolchain): data folder, log file,
++        # splash screen and default launch arguments (src/ps5_platform.c).
++        target_sources(${target} PRIVATE ${PSXRECOMP_ROOT}/runtime/src/ps5_platform.c)
++        if(PSX_PS5_DATA_DIR)
++            set_source_files_properties(${PSXRECOMP_ROOT}/runtime/src/ps5_platform.c
++                PROPERTIES COMPILE_DEFINITIONS "PSX_PS5_DATA_DIR=\"${PSX_PS5_DATA_DIR}\"")
++        endif()
++    endif()
+     # audio_trace.c uses C11 atomics. Make the runtime's actual language
+     # requirement explicit instead of relying on a parent project's global
+     # CMAKE_C_STANDARD setting. cxx_std_17 likewise — game CMakeLists may omit
+diff --git a/runtime/src/debug_server.c b/runtime/src/debug_server.c
+index 9d4b592..daa8744 100644
+--- a/runtime/src/debug_server.c
++++ b/runtime/src/debug_server.c
+@@ -12,6 +12,9 @@
+  * glibc — must precede any system header. Harmless on Windows/macOS. */
+ #ifdef __APPLE__
+ #  define _DARWIN_C_SOURCE 1   /* full BSD+POSIX namespace: clock_gettime AND INADDR_LOOPBACK/timeval */
++#elif defined(__FreeBSD__)
++   /* FreeBSD (PS5): the default namespace already has clock_gettime, and
++    * _POSIX_C_SOURCE would hide INADDR_LOOPBACK (__BSD_VISIBLE). */
+ #elif !defined(_POSIX_C_SOURCE)
+ #  define _POSIX_C_SOURCE 200809L
+ #endif
+diff --git a/runtime/src/dma.c b/runtime/src/dma.c
+index d9067b4..b7e9780 100644
+--- a/runtime/src/dma.c
++++ b/runtime/src/dma.c
+@@ -829,8 +829,9 @@ static DMAGpuHoldStats s_hold_stats;
+ static uint64_t hold_host_ticks(void) {
+ #ifdef _WIN32
+     LARGE_INTEGER c; QueryPerformanceCounter(&c); return (uint64_t)c.QuadPart;
+-#elif defined(__ANDROID__)
+-    /* Bionic has timespec_get only from API 29; diagnostics only. */
++#elif defined(__ANDROID__) || defined(__FreeBSD__)
++    /* Bionic has timespec_get only from API 29, the PS5 libc not at all;
++     * diagnostics only. */
+     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+ #else
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index c4b82ed..b5d8be5 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -157,6 +157,7 @@ extern "C" void psx_game_codegen_forward_if_built(int argc, char** argv);
+ #include <atomic>
+ #include <cerrno>
+ #include <mutex>
++#include <condition_variable>
+ #include <thread>
+ #include <cctype>
+ #include <cmath>
+@@ -587,6 +588,781 @@ static void android_dpad_drive_mouse(void) {
+ }
+ #endif
+ 
++#if defined(__PROSPERO__) && !defined(PSX_SDL3)
++/* PS5 (DualSense through the PS5 SDL2 port). No touch overlay or menu here,
++ * so the controller itself carries what Android's on-screen pad does:
++ *   - Sony Mouse titles (port 1 = mouse): touchpad = absolute pointer (finger
++ *     position = cursor position, steered via game.toml mouse_cursor) and
++ *     touchpad click = click there; sticks move the cursor; D-pad
++ *     steps it (Android's tap/repeat rule); Cross = left, Circle = right.
++ *   - Options held as a modifier: + L1 / R1 = insert disc 1 / disc 2,
++ *     + Square / Triangle = save / load state slot 1, + L3 = FPS readout.
++ *     Settings: <data>/ps5_controls.ini.
++ * The disc roster is filled at boot by the same code as Android's. */
++static std::vector<std::string> g_disc_swap_paths;
++static std::atomic<int> g_android_disc_count{0};
++static std::atomic<int> g_android_disc_current{0};
++static std::atomic<int> g_android_disc_swap_request{0};
++
++static void ps5_apply_disc_swap(int want)
++{
++    if (want < 1 || want > (int)g_disc_swap_paths.size()) {
++        host_osd_push("This game has only one disc", 2000);
++        return;
++    }
++    if (want == g_android_disc_current.load()) {
++        host_osd_push(("Disc " + std::to_string(want) + " is already in").c_str(), 2000);
++        return;
++    }
++    if (!cdrom_swap_disc(g_disc_swap_paths[(size_t)want - 1].c_str())) {
++        host_osd_push(("Disc " + std::to_string(want) + " could not be opened").c_str(), 3000);
++        return;
++    }
++    g_android_disc_current.store(want);
++    savestate_set_disc_scope(want);
++    host_osd_push(("Disc " + std::to_string(want) + " inserted").c_str(), 2500);
++}
++
++static void fps_telemetry_toggle(void);
++
++/* Raw DualSense state from the PS5 SDL2 port (psxrecomp patch to
++ * src/joystick/ps5/SDL_ps5joystick.c): buttons, sticks, touchpad fingers and
++ * gyro, independent of SDL's controller-mapping layer. */
++extern "C" {
++typedef struct SDL_PS5_PadExtra {
++    int connected;
++    Uint32 buttons;
++    int fingers;
++    int tx[2], ty[2];
++    int tid[2];
++    float gyro[3];
++    float accel[3];
++    Uint64 timestamp;
++    Uint8 lx, ly, rx, ry;
++    Uint8 l2, r2;
++    Uint8 raw[128];
++    int raw_size;
++} SDL_PS5_PadExtra;
++int SDL_PS5_GetPadExtra(int index, SDL_PS5_PadExtra *out);
++}
++
++enum : uint32_t {
++    PS5B_L3 = 0x0002, PS5B_R3 = 0x0004, PS5B_OPTIONS = 0x0008,
++    PS5B_UP = 0x0010, PS5B_RIGHT = 0x0020, PS5B_DOWN = 0x0040, PS5B_LEFT = 0x0080,
++    PS5B_L2 = 0x0100, PS5B_R2 = 0x0200, PS5B_L1 = 0x0400, PS5B_R1 = 0x0800,
++    PS5B_TRIANGLE = 0x1000, PS5B_CIRCLE = 0x2000, PS5B_CROSS = 0x4000,
++    PS5B_SQUARE = 0x8000, PS5B_TOUCHPAD = 0x100000,
++};
++
++/* <data>/ps5_controls.ini (created with defaults on first launch). */
++struct Ps5Controls {
++    float stick_speed = 1.0f;
++    bool touch_pointer = true;
++    /* game.toml [controller] mouse_cursor: where the game keeps its cursor. */
++    bool cursor_known = false;
++    int area_w = 320, area_h = 240;
++    int touch_w = 1920, touch_h = 1080;   /* grows if larger coordinates are seen */
++    bool usb_mouse = true;
++    float usb_mouse_speed = 1.0f;
++};
++static Ps5Controls g_ps5c;
++
++static bool ps5_ini_bool(const char *v) {
++    return !(std::strncmp(v, "off", 3) == 0 || std::strncmp(v, "0", 1) == 0 ||
++             std::strncmp(v, "false", 5) == 0 || std::strncmp(v, "no", 2) == 0);
++}
++
++static void ps5_controls_load(void)
++{
++    static const char *kDefaults =
++        "# PS5 controls for this game. Edit, then restart the game.\n"
++        "# sticks and D-pad move the cursor too; stick_speed scales the sticks.\n"
++        "stick_speed = 1.0\n"
++        "# touch_pointer: where your finger is on the touchpad is where the\n"
++        "# cursor goes on screen; clicking the touchpad clicks there.\n"
++        "touch_pointer = on\n"
++        "# usb_mouse: a USB or Bluetooth mouse moves the cursor and clicks;\n"
++        "# usb_mouse_speed scales it (0.5 = half as fast).\n"
++        "usb_mouse = on\n"
++        "usb_mouse_speed = 1.0\n";
++    FILE *f = std::fopen("ps5_controls.ini", "r");
++    if (!f) {
++        if (FILE *w = std::fopen("ps5_controls.ini", "w")) {
++            std::fputs(kDefaults, w);
++            std::fclose(w);
++        }
++        f = std::fopen("ps5_controls.ini", "r");
++    }
++    char line[256];
++    while (f && std::fgets(line, sizeof(line), f)) {
++        char key[64], val[64];
++        if (line[0] == '#' || std::sscanf(line, " %63[a-z_] = %63s", key, val) != 2) continue;
++        if (!std::strcmp(key, "stick_speed")) g_ps5c.stick_speed = (float)std::atof(val);
++        else if (!std::strcmp(key, "touch_pointer")) g_ps5c.touch_pointer = ps5_ini_bool(val);
++        else if (!std::strcmp(key, "usb_mouse")) g_ps5c.usb_mouse = ps5_ini_bool(val);
++        else if (!std::strcmp(key, "usb_mouse_speed")) g_ps5c.usb_mouse_speed = (float)std::atof(val);
++    }
++    if (f) std::fclose(f);
++
++    /* mouse_cursor = "0xXADDR,0xYADDR,W,H" (the Android overlay passes the same
++     * value through JNI): lets the touch pointer steer the game's real cursor. */
++    if (FILE *g = std::fopen("game.toml", "r")) {
++        while (std::fgets(line, sizeof(line), g)) {
++            unsigned xa = 0, ya = 0;
++            int w = 0, h = 0;
++            const char *k = std::strstr(line, "mouse_cursor");
++            if (!k || line[0] == '#') continue;
++            const char *q = std::strchr(k, '"');
++            if (q && std::sscanf(q + 1, "%x , %x , %d , %d", &xa, &ya, &w, &h) == 4 &&
++                xa && ya && w > 0 && h > 0) {
++                sio_mouse_cursor_addr(xa, ya);
++                g_ps5c.cursor_known = true;
++                g_ps5c.area_w = w;
++                g_ps5c.area_h = h;
++            }
++        }
++        std::fclose(g);
++    }
++    std::fprintf(stderr, "[ps5] controls: stick_speed=%.2f touch_pointer=%d usb_mouse=%d (%.2f) cursor=%s (%dx%d)\n",
++                 g_ps5c.stick_speed, g_ps5c.touch_pointer, g_ps5c.usb_mouse, g_ps5c.usb_mouse_speed,
++                 g_ps5c.cursor_known ? "known" : "unknown", g_ps5c.area_w, g_ps5c.area_h);
++}
++
++/* SDL's PS5 driver reads (and so fills SDL_PS5_GetPadExtra for) only pads
++ * someone has opened. With port 1 a Sony Mouse the runtime opens none
++ * (PPSA77066 B6: no input at all), so hold our own controller handle. */
++static SDL_GameController *ps5_controller(void)
++{
++    static SDL_GameController *gc = nullptr;
++    static SDL_Joystick *js = nullptr;
++    if (gc && SDL_GameControllerGetAttached(gc)) return gc;
++    if (js && !gc && SDL_JoystickGetAttached(js)) return nullptr;
++    if (gc) { SDL_GameControllerClose(gc); gc = nullptr; }
++    if (js) { SDL_JoystickClose(js); js = nullptr; }
++    for (int i = 0; i < SDL_NumJoysticks(); i++) {
++        if (SDL_IsGameController(i) && (gc = SDL_GameControllerOpen(i)) != nullptr) {
++            std::fprintf(stderr, "[ps5] opened controller %d: %s\n", i,
++                         SDL_GameControllerName(gc) ? SDL_GameControllerName(gc) : "?");
++            return gc;
++        }
++        if ((js = SDL_JoystickOpen(i)) != nullptr) {
++            std::fprintf(stderr, "[ps5] opened joystick %d (no controller mapping): %s\n", i,
++                         SDL_JoystickName(js) ? SDL_JoystickName(js) : "?");
++            return nullptr;
++        }
++    }
++    return nullptr;
++}
++
++/* Raw pad if the patched driver has it, else rebuilt from SDL's controller
++ * API (no touchpad/gyro then). */
++static bool ps5_read_pad(SDL_PS5_PadExtra &pad, int *source)
++{
++    SDL_GameController *gc = ps5_controller();
++    pad = SDL_PS5_PadExtra{};
++    if (SDL_PS5_GetPadExtra(0, &pad) == 0 && pad.connected) {
++        *source = 1;
++        return true;
++    }
++    if (!gc) {
++        *source = 0;
++        return false;
++    }
++    pad = SDL_PS5_PadExtra{};
++    pad.connected = 1;
++    struct { SDL_GameControllerButton sb; uint32_t bit; } map[] = {
++        {SDL_CONTROLLER_BUTTON_A, PS5B_CROSS}, {SDL_CONTROLLER_BUTTON_B, PS5B_CIRCLE},
++        {SDL_CONTROLLER_BUTTON_X, PS5B_SQUARE}, {SDL_CONTROLLER_BUTTON_Y, PS5B_TRIANGLE},
++        {SDL_CONTROLLER_BUTTON_LEFTSHOULDER, PS5B_L1}, {SDL_CONTROLLER_BUTTON_RIGHTSHOULDER, PS5B_R1},
++        {SDL_CONTROLLER_BUTTON_LEFTSTICK, PS5B_L3}, {SDL_CONTROLLER_BUTTON_RIGHTSTICK, PS5B_R3},
++        {SDL_CONTROLLER_BUTTON_START, PS5B_OPTIONS}, {SDL_CONTROLLER_BUTTON_TOUCHPAD, PS5B_TOUCHPAD},
++        {SDL_CONTROLLER_BUTTON_DPAD_UP, PS5B_UP}, {SDL_CONTROLLER_BUTTON_DPAD_DOWN, PS5B_DOWN},
++        {SDL_CONTROLLER_BUTTON_DPAD_LEFT, PS5B_LEFT}, {SDL_CONTROLLER_BUTTON_DPAD_RIGHT, PS5B_RIGHT},
++    };
++    for (const auto &m : map)
++        if (SDL_GameControllerGetButton(gc, m.sb)) pad.buttons |= m.bit;
++    auto ax = [gc](SDL_GameControllerAxis a) {
++        return (Uint8)std::clamp(128 + SDL_GameControllerGetAxis(gc, a) / 256, 0, 255);
++    };
++    pad.lx = ax(SDL_CONTROLLER_AXIS_LEFTX);
++    pad.ly = ax(SDL_CONTROLLER_AXIS_LEFTY);
++    pad.rx = ax(SDL_CONTROLLER_AXIS_RIGHTX);
++    pad.ry = ax(SDL_CONTROLLER_AXIS_RIGHTY);
++    *source = 2;
++    return true;
++}
++
++/* PS5 asynchronous present. The software frame is handed to a present
++ * thread that scales it straight into the scan-out buffer, tiles it, flips
++ * and waits for vblank (SDL_PS5_PresentPixels, psxrecomp patch to the PS5
++ * SDL2 video driver), while the emulator thread goes on to the next frame.
++ * B7 log: game 15.4 ms + SDL renderer scale/blend 13.3 ms + wait, run in
++ * series = every other vblank = 30 fps. In parallel the frame costs the
++ * larger of the two, not the sum. Latest frame wins; a stale pending frame
++ * is replaced, never queued. */
++extern "C" int SDL_PS5_PresentPixels(const Uint32 *argb, int w, int h, int pitch_px,
++                                     int dx, int dy, int dw, int dh);
++extern "C" void SDL_PS5_TakePresentStats(Uint64 *frames, double *blit_ms, double *wait_ms,
++                                         int *w, int *h);
++extern "C" double SDL_PS5_TakeScaleMs(void);
++extern "C" {
++typedef struct SDL_PS5_Overlay {
++    const Uint32 *argb;
++    int w, h;
++    int dx, dy, dw, dh;
++} SDL_PS5_Overlay;
++int SDL_PS5_PresentPixelsOverlay(const Uint32 *argb, int w, int h, int pitch_px,
++                                 int dx, int dy, int dw, int dh,
++                                 const SDL_PS5_Overlay *ov, int nov);
++}
++
++struct Ps5PresentQueue {
++    std::mutex m;
++    std::condition_variable cv;
++    std::vector<uint32_t> pending, work;
++    int w = 0, h = 0;
++    SDL_Rect dst{};
++    /* OSD images (message text, volume bar) with their screen rectangles. */
++    std::vector<uint32_t> osd_pending[2], osd_work[2];
++    SDL_PS5_Overlay ov_pending[2]{}, ov_work[2]{};
++    int nov_pending = 0;
++    bool have = false;
++    bool started = false;
++    uint64_t submitted = 0, replaced = 0, failed = 0;
++};
++static Ps5PresentQueue g_ps5q;
++
++static void ps5_present_thread_main(void)
++{
++    for (;;) {
++        int w, h, nov;
++        SDL_Rect d;
++        {
++            std::unique_lock<std::mutex> lk(g_ps5q.m);
++            g_ps5q.cv.wait(lk, [] { return g_ps5q.have; });
++            std::swap(g_ps5q.pending, g_ps5q.work);
++            w = g_ps5q.w;
++            h = g_ps5q.h;
++            d = g_ps5q.dst;
++            nov = g_ps5q.nov_pending;
++            for (int i = 0; i < nov; i++) {
++                std::swap(g_ps5q.osd_pending[i], g_ps5q.osd_work[i]);
++                g_ps5q.ov_work[i] = g_ps5q.ov_pending[i];
++                g_ps5q.ov_work[i].argb = g_ps5q.osd_work[i].data();
++            }
++            g_ps5q.have = false;
++        }
++        if (SDL_PS5_PresentPixelsOverlay(g_ps5q.work.data(), w, h, w, d.x, d.y, d.w, d.h,
++                                         g_ps5q.ov_work, nov) != 0)
++            g_ps5q.failed++;
++    }
++}
++
++extern "C" SDL_Window* sdl_window;   /* defined below (file scope) */
++
++/* dst is in the renderer's logical space (logical_w x logical_h); map it onto
++ * the window with the same aspect fit SDL's logical size would apply. */
++static bool ps5_present_submit(const uint32_t *px, int w, int h, const SDL_Rect &dst,
++                               int logical_w, int logical_h)
++{
++    if (!sdl_window || !px || w <= 0 || h <= 0 || logical_w <= 0 || logical_h <= 0)
++        return false;
++    int ww = 0, wh = 0;
++    SDL_GetWindowSize(sdl_window, &ww, &wh);
++    if (ww <= 0 || wh <= 0) return false;
++    const double f = std::min((double)ww / logical_w, (double)wh / logical_h);
++    const double ox = (ww - logical_w * f) / 2.0, oy = (wh - logical_h * f) / 2.0;
++    SDL_Rect d;
++    d.x = (int)std::lround(ox + dst.x * f);
++    d.y = (int)std::lround(oy + dst.y * f);
++    d.w = (int)std::lround(dst.w * f);
++    d.h = (int)std::lround(dst.h * f);
++    if (!g_ps5q.started) {
++        g_ps5q.started = true;
++        std::thread(ps5_present_thread_main).detach();
++        std::fprintf(stderr, "[ps5] async present thread started (%dx%d -> %d,%d %dx%d)\n",
++                     w, h, d.x, d.y, d.w, d.h);
++    }
++    /* On-screen messages, placed as host_osd_draw_sdl() places them in the
++     * logical space (text top-left, volume bar right-centre), then mapped to
++     * the screen like the frame. */
++    struct OsdImg { const uint32_t *px; int w, h; SDL_Rect r; };
++    OsdImg osd[2];
++    int nosd = 0;
++    {
++        const int ui = std::max(1, std::min(8, logical_h / 480));
++        const int margin = 8 * ui;
++        const uint32_t *opx = nullptr;
++        int ow = 0, oh = 0;
++        auto to_screen = [&](int lx, int ly, int lw2, int lh2) {
++            SDL_Rect r;
++            r.x = (int)std::lround(ox + lx * f);
++            r.y = (int)std::lround(oy + ly * f);
++            r.w = (int)std::lround(lw2 * f);
++            r.h = (int)std::lround(lh2 * f);
++            return r;
++        };
++        if (host_osd_image(&opx, &ow, &oh) && opx && ow > 0 && oh > 0)
++            osd[nosd++] = {opx, ow, oh, to_screen(margin, margin, ow * ui, oh * ui)};
++        if (host_osd_volume_image(&opx, &ow, &oh) && opx && ow > 0 && oh > 0) {
++            const int dw2 = ow * ui, dh2 = oh * ui;
++            const int vx = (logical_w > dw2 + margin) ? (logical_w - dw2 - margin) : margin;
++            const int vy = (logical_h > dh2) ? ((logical_h - dh2) / 2) : margin;
++            osd[nosd++] = {opx, ow, oh, to_screen(vx, vy, dw2, dh2)};
++        }
++        host_osd_present_done();
++    }
++    {
++        std::lock_guard<std::mutex> lk(g_ps5q.m);
++        if (g_ps5q.have) g_ps5q.replaced++;
++        g_ps5q.pending.assign(px, px + (size_t)w * h);
++        g_ps5q.w = w;
++        g_ps5q.h = h;
++        g_ps5q.dst = d;
++        g_ps5q.nov_pending = nosd;
++        for (int i = 0; i < nosd; i++) {
++            g_ps5q.osd_pending[i].assign(osd[i].px, osd[i].px + (size_t)osd[i].w * osd[i].h);
++            g_ps5q.ov_pending[i] = SDL_PS5_Overlay{nullptr, osd[i].w, osd[i].h,
++                                                   osd[i].r.x, osd[i].r.y, osd[i].r.w, osd[i].r.h};
++        }
++        g_ps5q.have = true;
++        g_ps5q.submitted++;
++    }
++    g_ps5q.cv.notify_one();
++    return true;
++}
++
++/* Frame-time breakdown for the PS5 log, every 5 s. */
++static Uint64 s_ps5_report_t0 = 0;
++static uint64_t s_ps5_report_vblanks = 0;
++static void ps5_frame_report(void)
++{
++    const Uint64 now = SDL_GetPerformanceCounter(), freq = SDL_GetPerformanceFrequency();
++    s_ps5_report_vblanks++;
++    if (!s_ps5_report_t0) { s_ps5_report_t0 = now; return; }
++    const double wall_ms = (double)(now - s_ps5_report_t0) * 1000.0 / (double)freq;
++    if (wall_ms < 5000.0) return;
++    const double scale_ms = SDL_PS5_TakeScaleMs();
++    Uint64 shown = 0;
++    double blit_ms = 0, wait_ms = 0;
++    int w = 0, h = 0;
++    SDL_PS5_TakePresentStats(&shown, &blit_ms, &wait_ms, &w, &h);
++    const double dn = shown ? (double)shown : 1.0;
++    uint64_t submitted, replaced, failed;
++    {
++        std::lock_guard<std::mutex> lk(g_ps5q.m);
++        submitted = g_ps5q.submitted;
++        replaced = g_ps5q.replaced;
++        failed = g_ps5q.failed;
++        g_ps5q.submitted = g_ps5q.replaced = g_ps5q.failed = 0;
++    }
++    std::fprintf(stderr,
++        "[ps5] 5s: emulator %.1f frames/s (%.2f ms each) | shown %.1f/s: scale %.2f + tiled %.2f + "
++        "vblank wait %.2f ms | submitted %llu, replaced %llu, failed %llu | %dx%d\n",
++        s_ps5_report_vblanks * 1000.0 / wall_ms, wall_ms / (double)s_ps5_report_vblanks,
++        shown * 1000.0 / wall_ms, scale_ms / dn, blit_ms / dn, wait_ms / dn,
++        (unsigned long long)submitted, (unsigned long long)replaced,
++        (unsigned long long)failed, w, h);
++    s_ps5_report_vblanks = 0;
++    s_ps5_report_t0 = now;
++}
++static void ps5_note_present(Uint64, Uint64) {}
++
++/* USB / Bluetooth mouse through the system's libSceMouse, with the
++ * mousebridge payload's help (~/work/mousebridge).
++ *
++ * The title can load libSceMouse.sprx from the sandbox, but a fake-signed
++ * title cannot look up its functions: sceKernelDlsym -> 0x80020003 for every
++ * name/NID (B12) and imports bind to NULL (B13). So the game loads the module,
++ * fills a mailbox in its own memory and leaves a request file in
++ * /data/mousebridge/; the resident mousebridge payload resolves the functions
++ * inside this process with kernel access and writes their addresses into the
++ * mailbox (raising the process's caps/authid on a retry request if the open
++ * fails). The game polls the mailbox once a frame, so the payload can be sent
++ * before or after the game starts. Layout/ABI as in the PS4 SDK headers. */
++#include <dirent.h>
++#include <sys/stat.h>
++#include <unistd.h>
++extern "C" {
++int32_t sceKernelLoadStartModule(const char *path, size_t argc, const void *argv,
++                                 uint32_t flags, void *opt, int *res);
++const char *sceKernelGetFsSandboxRandomWord(void);
++int32_t sceUserServiceGetInitialUser(int32_t *user);
++int32_t sceUserServiceGetForegroundUser(int32_t *user);
++}
++struct Ps5MouseData {
++    uint64_t timestamp;
++    bool connected;
++    uint32_t buttons;
++    int32_t x, y, wheel, tilt;
++    uint8_t reserve[8];
++};
++/* Same layout as struct mb_mailbox in mousebridge/main.c. */
++struct Ps5MouseMailbox {
++    uint64_t magic;
++    uint64_t fn[5];   /* init, open, read, close, setProcessPrivilege */
++    int32_t status;   /* 0 waiting, >0 done (elevation + 1), <0 failed */
++    int32_t pad;
++};
++static constexpr uint64_t kMouseMailboxMagic = 0x3152424553554F4DULL;   /* "MOUSEBR1" */
++alignas(64) static volatile Ps5MouseMailbox g_mouse_mb;
++
++struct Ps5HidMouse {
++    enum { kOff, kWaiting, kReady } state = kOff;
++    bool ok = false, connected = false, left = false, right = false;
++    int module = -1, handle = -1, elevate = 0, wait_frames = 0;
++    int32_t (*read)(int32_t, Ps5MouseData *, int32_t) = nullptr;
++    float carry_x = 0.0f, carry_y = 0.0f;
++    int moved_x = 0, moved_y = 0, clicks = 0;
++};
++static Ps5HidMouse g_hid;
++
++static void ps5_mouse_request(int elevate)
++{
++    g_mouse_mb.status = 0;
++    mkdir("/data/mousebridge", 0777);
++    char path[96], tmp[100];
++    std::snprintf(path, sizeof(path), "/data/mousebridge/request-%d.txt", (int)getpid());
++    std::snprintf(tmp, sizeof(tmp), "%s.tmp", path);
++    FILE *f = std::fopen(tmp, "w");
++    if (!f) {
++        std::fprintf(stderr, "[ps5] usb mouse: cannot write %s: %s\n", tmp, std::strerror(errno));
++        g_hid.state = Ps5HidMouse::kOff;
++        return;
++    }
++    std::fprintf(f, "%d %u %llx %d\n", (int)getpid(), (unsigned)g_hid.module,
++                 (unsigned long long)(uintptr_t)&g_mouse_mb, elevate);
++    std::fclose(f);
++    std::rename(tmp, path);   /* the bridge only picks up complete files */
++    g_hid.elevate = elevate;
++    g_hid.wait_frames = 0;
++    g_hid.state = Ps5HidMouse::kWaiting;
++    std::fprintf(stderr, "[ps5] usb mouse: request (elevate %d) waiting for mousebridge\n", elevate);
++}
++
++static void ps5_hid_mouse_open(void)
++{
++    const char *word = sceKernelGetFsSandboxRandomWord();
++    char path[160];
++    std::snprintf(path, sizeof(path), "/%s/common/lib/libSceMouse.sprx", word ? word : "system");
++    int res = 0;
++    const int mod = sceKernelLoadStartModule(path, 0, nullptr, 0, nullptr, &res);
++    std::fprintf(stderr, "[ps5] usb mouse: load %s -> 0x%x\n", path, (unsigned)mod);
++    if (mod < 0) return;
++    g_hid.module = mod;
++    g_mouse_mb.magic = kMouseMailboxMagic;
++    ps5_mouse_request(0);
++}
++
++/* Once a frame: has the bridge answered? Then open the mouse; if the open is
++ * refused, ask the bridge for more privilege and try again (up to authid). */
++static void ps5_hid_mouse_step(void)
++{
++    if (g_hid.state != Ps5HidMouse::kWaiting) return;
++    const int32_t st = g_mouse_mb.status;
++    if (st == 0) {
++        if (++g_hid.wait_frames == 600 && g_hid.elevate == 0)
++            std::fprintf(stderr, "[ps5] usb mouse: no answer yet - send mousebridge.elf to "
++                                 "port 9021 (the game keeps waiting)\n");
++        return;
++    }
++    if (st < 0) {
++        std::fprintf(stderr, "[ps5] usb mouse: bridge could not resolve libSceMouse; mouse off\n");
++        g_hid.state = Ps5HidMouse::kOff;
++        return;
++    }
++    auto init = reinterpret_cast<int32_t (*)(void)>(g_mouse_mb.fn[0]);
++    auto open = reinterpret_cast<int32_t (*)(int32_t, int32_t, int32_t, void *)>(g_mouse_mb.fn[1]);
++    auto priv = reinterpret_cast<int32_t (*)(int32_t)>(g_mouse_mb.fn[4]);
++    const int ir = init();
++    int32_t user = -1;
++    if (sceUserServiceGetForegroundUser(&user) != 0 || user < 0)
++        sceUserServiceGetInitialUser(&user);
++    uint8_t param[8] = {0};   /* SceMouseOpenParam: behaviorFlag 0 = merged */
++    int h = open(user, 0, 0, param);
++    std::fprintf(stderr, "[ps5] usb mouse: bridged (status %d): init -> 0x%x, open(user 0x%x) -> 0x%x\n",
++                 (int)st, (unsigned)ir, (unsigned)user, (unsigned)h);
++    if (h < 0 && priv) {
++        const int pr = priv(1);
++        h = open(user, 0, 0, param);
++        std::fprintf(stderr, "[ps5] usb mouse: privilege -> 0x%x, open again -> 0x%x\n",
++                     (unsigned)pr, (unsigned)h);
++    }
++    if (h < 0) {
++        if (g_hid.elevate < 2) ps5_mouse_request(g_hid.elevate + 1);
++        else {
++            std::fprintf(stderr, "[ps5] usb mouse: open refused even with full privilege; mouse off\n");
++            g_hid.state = Ps5HidMouse::kOff;
++        }
++        return;
++    }
++    g_hid.handle = h;
++    g_hid.read = reinterpret_cast<int32_t (*)(int32_t, Ps5MouseData *, int32_t)>(g_mouse_mb.fn[2]);
++    g_hid.ok = true;
++    g_hid.state = Ps5HidMouse::kReady;
++    host_osd_push("USB mouse ready", 2000);
++}
++
++/* Poll the mouse; moves the PS1 mouse directly. Buttons land in g_hid. */
++static void ps5_hid_mouse_poll(int port1_mouse, float speed)
++{
++    if (!g_hid.ok) return;
++    Ps5MouseData d[8];
++    std::memset(d, 0, sizeof(d));
++    const int n = g_hid.read(g_hid.handle, d, 8);
++    if (n <= 0) return;
++    int sx = 0, sy = 0;
++    for (int i = 0; i < n && i < 8; i++) {
++        sx += d[i].x;
++        sy += d[i].y;
++    }
++    const Ps5MouseData &last = d[(n < 8 ? n : 8) - 1];
++    if (last.connected != g_hid.connected) {
++        g_hid.connected = last.connected;
++        std::fprintf(stderr, "[ps5] usb mouse %s\n", last.connected ? "connected" : "disconnected");
++        if (last.connected) host_osd_push("USB mouse connected", 2000);
++    }
++    /* First samples with anything in them, raw, in case the layout differs. */
++    static int dumps = 0;
++    if (dumps < 4 && (sx || sy || last.buttons)) {
++        dumps++;
++        const uint8_t *r = reinterpret_cast<const uint8_t *>(&d[0]);
++        char hex[3 * 40 + 1];
++        int k = 0;
++        for (int i = 0; i < 40; i++) k += std::snprintf(hex + k, sizeof(hex) - k, "%02x ", r[i]);
++        std::fprintf(stderr, "[ps5] usb mouse sample n=%d dx=%d dy=%d buttons=%x raw=%s\n",
++                     n, sx, sy, (unsigned)last.buttons, hex);
++    }
++    const bool l = (last.buttons & 1) != 0, r = (last.buttons & 2) != 0;
++    if (l && !g_hid.left) g_hid.clicks++;
++    g_hid.left = l;
++    g_hid.right = r;
++    if (!port1_mouse) return;
++    /* PC mice report far more counts than the PS1 mouse; halve, then scale. */
++    g_hid.carry_x += sx * 0.5f * speed;
++    g_hid.carry_y += sy * 0.5f * speed;
++    const int dx = (int)g_hid.carry_x, dy = (int)g_hid.carry_y;
++    g_hid.carry_x -= dx;
++    g_hid.carry_y -= dy;
++    if (dx || dy) {
++        sio_set_mouse_motion(dx, dy);
++        g_hid.moved_x += dx;
++        g_hid.moved_y += dy;
++    }
++}
++
++/* Called once per VBlank on the emulator thread. */
++static void ps5_controller_frame(int port1_mouse)
++{
++    static bool inited = false;
++    if (!inited) {
++        inited = true;
++        ps5_controls_load();
++        if (g_ps5c.usb_mouse) ps5_hid_mouse_open();
++    }
++    ps5_frame_report();
++    ps5_hid_mouse_step();
++    ps5_hid_mouse_poll(port1_mouse, g_ps5c.usb_mouse_speed);
++    {
++        static int hid_frames = 0;
++        if (g_hid.ok && ++hid_frames >= 300) {
++            if (g_hid.moved_x || g_hid.moved_y || g_hid.clicks)
++                std::fprintf(stderr, "[ps5] usb mouse 5s: motion %+d,%+d  clicks %d\n",
++                             g_hid.moved_x, g_hid.moved_y, g_hid.clicks);
++            g_hid.moved_x = g_hid.moved_y = g_hid.clicks = hid_frames = 0;
++        }
++    }
++    SDL_PS5_PadExtra pad{};
++    int source = 0;
++    const bool have = ps5_read_pad(pad, &source);
++    static int last_source = -1;
++    if (source != last_source) {
++        static const char *names[] = {"none", "raw DualSense (touchpad+gyro)", "SDL controller (no touchpad/gyro)"};
++        std::fprintf(stderr, "[ps5] controller input: %s (SDL sees %d joystick(s))\n",
++                     names[source], SDL_NumJoysticks());
++        last_source = source;
++    }
++    /* First 10 s of input: one state line per second, to see what arrives. */
++    static int diag_frames = 0;
++    if (have && diag_frames < 600 && (++diag_frames % 60) == 0)
++        std::fprintf(stderr, "[ps5] pad: buttons=%06x L=%d,%d R=%d,%d fingers=%d touch=%d,%d\n",
++                     (unsigned)pad.buttons, pad.lx, pad.ly, pad.rx, pad.ry, pad.fingers,
++                     pad.tx[0], pad.ty[0]);
++    /* Touchpad click = a finger is on the pad: dump the raw state the first
++     * few times, to check where the PS5 keeps the touch coordinates (B7 never
++     * saw a finger). */
++    {
++        static bool prev_click = false;
++        static int dumps = 0;
++        const bool click = have && (pad.buttons & PS5B_TOUCHPAD);
++        if (click && !prev_click && dumps < 6 && source == 1) {
++            dumps++;
++            char hex[3 * 128 + 1];
++            int n = 0;
++            for (int i = 0; i < pad.raw_size && i < 128; i++)
++                n += std::snprintf(hex + n, sizeof(hex) - n, "%02x%s", pad.raw[i],
++                                   (i % 16 == 15) ? "|" : " ");
++            std::fprintf(stderr, "[ps5] touch press: fingers=%d xy=%d,%d raw(%d)=%s\n",
++                         pad.fingers, pad.tx[0], pad.ty[0], pad.raw_size, hex);
++        }
++        prev_click = click;
++    }
++    if (!have) {
++        /* No controller: the USB mouse alone still clicks. */
++        static bool pl, pr;
++        if (port1_mouse && (g_hid.left != pl || g_hid.right != pr))
++            sio_set_mouse_buttons(g_hid.left, g_hid.right);
++        pl = g_hid.left;
++        pr = g_hid.right;
++        return;
++    }
++    const uint32_t b = pad.buttons;
++    const bool opt = (b & PS5B_OPTIONS) != 0;
++
++    /* Options-held shortcuts: once per press, then a second's rest (B3 fired
++     * twice per press when the modifier dropped out for a frame). */
++    enum { kL1, kR1, kSq, kTri, kL3, kCombos };
++    static const uint32_t combo_bit[kCombos] = {
++        PS5B_L1, PS5B_R1, PS5B_SQUARE, PS5B_TRIANGLE, PS5B_L3};
++    static bool prev[kCombos];
++    static int cooldown[kCombos];
++    for (int i = 0; i < kCombos; i++) {
++        const bool now = opt && (b & combo_bit[i]);
++        if (cooldown[i] > 0) cooldown[i]--;
++        const bool fire = now && !prev[i] && cooldown[i] == 0;
++        prev[i] = now;
++        if (!fire) continue;
++        cooldown[i] = 60;
++        switch (i) {
++        case kL1: ps5_apply_disc_swap(1); break;
++        case kR1: ps5_apply_disc_swap(2); break;
++        case kSq:
++            if (!savestate_request_save(0)) host_osd_push("Save state not available", 2500);
++            break;
++        case kTri:
++            if (!savestate_request_load(0)) host_osd_push("Load state not available", 2500);
++            break;
++        case kL3: fps_telemetry_toggle(); break;
++        }
++    }
++    if (!port1_mouse) return;
++
++    static int motion_x = 0, motion_y = 0, clicks = 0, touches = 0, frames = 0;
++
++    /* Buttons: Cross / touchpad click = left, Circle = right. Not while
++     * Options is held (shortcuts). A touchpad click with the touch pointer
++     * steering is delivered as a click on arrival (sio_mouse_point). */
++    const bool touching = g_ps5c.touch_pointer && pad.fingers > 0;
++    const bool steer_click = touching && g_ps5c.cursor_known;
++    static bool prev_left, prev_right, prev_touch_click;
++    const bool touch_click = !opt && (b & PS5B_TOUCHPAD);
++    const bool left = g_hid.left || (!opt && ((b & PS5B_CROSS) || (touch_click && !steer_click)));
++    const bool right = g_hid.right || (!opt && (b & PS5B_CIRCLE));
++    if (left != prev_left || right != prev_right) {
++        sio_set_mouse_buttons(left, right);
++        if (left && !prev_left) clicks++;
++    }
++    prev_left = left;
++    prev_right = right;
++
++    /* Touch pointer: finger position on the pad = cursor position on screen. */
++    static int last_tx = -1, last_ty = -1, last_fx = -1, last_fy = -1;
++    if (touching && !opt) {
++        int fx = pad.tx[0], fy = pad.ty[0];
++        if (fx >= g_ps5c.touch_w) g_ps5c.touch_w = fx + 1;
++        if (fy >= g_ps5c.touch_h) g_ps5c.touch_h = fy + 1;
++        const int x = fx * g_ps5c.area_w / g_ps5c.touch_w;
++        const int y = fy * g_ps5c.area_h / g_ps5c.touch_h;
++        const bool click_edge = touch_click && !prev_touch_click;
++        if (g_ps5c.cursor_known) {
++            if (last_tx < 0 || std::abs(x - last_tx) >= 2 || std::abs(y - last_ty) >= 2 ||
++                click_edge) {
++                sio_mouse_point(x, y, click_edge ? 1 : 0, 0);
++                last_tx = x;
++                last_ty = y;
++                if (click_edge) clicks++;
++            }
++        } else if (last_fx >= 0) {
++            /* Cursor address unknown: behave like a laptop trackpad. */
++            const int dx = (fx - last_fx) * g_ps5c.area_w / g_ps5c.touch_w;
++            const int dy = (fy - last_fy) * g_ps5c.area_h / g_ps5c.touch_h;
++            if (dx || dy) {
++                sio_set_mouse_motion(dx, dy);
++                motion_x += dx;
++                motion_y += dy;
++            }
++        }
++        last_fx = fx;
++        last_fy = fy;
++        if (last_tx < 0) touches++;
++    } else {
++        last_tx = last_ty = last_fx = last_fy = -1;
++    }
++    prev_touch_click = touch_click;
++    if (opt) return;
++
++    float mx = 0.0f, my = 0.0f;
++
++    /* Sticks (analog): radial deadzone, quadratic response, up to ~9 mouse
++     * counts per frame at full tilt. */
++    const uint8_t sticks[2][2] = {{pad.lx, pad.ly}, {pad.rx, pad.ry}};
++    for (const auto &st : sticks) {
++        const float x = ((int)st[0] - 128) / 127.0f;
++        const float y = ((int)st[1] - 128) / 127.0f;
++        const float mag = std::sqrt(x * x + y * y);
++        constexpr float kDead = 0.22f;
++        if (mag <= kDead) continue;
++        const float t = std::min(1.0f, (mag - kDead) / (1.0f - kDead));
++        const float speed = (1.0f + 8.0f * t * t) * g_ps5c.stick_speed;
++        mx += x / mag * speed;
++        my += y / mag * speed;
++    }
++
++    static float carry_x, carry_y;
++    carry_x += mx;
++    carry_y += my;
++    const int dx = (int)carry_x, dy = (int)carry_y;
++    carry_x -= dx;
++    carry_y -= dy;
++    if (mx == 0.0f) carry_x = 0.0f;
++    if (my == 0.0f) carry_y = 0.0f;
++
++    /* D-pad: one firm step on press, pause, then accelerating repeat. */
++    static constexpr int kTapStep = 20, kRepeatDelay = 15;
++    static int held_frames = 0, last_px = 0, last_py = 0;
++    const int px = ((b & PS5B_RIGHT) ? 1 : 0) - ((b & PS5B_LEFT) ? 1 : 0);
++    const int py = ((b & PS5B_DOWN) ? 1 : 0) - ((b & PS5B_UP) ? 1 : 0);
++    int step = 0;
++    if (px || py) {
++        if (px != last_px || py != last_py) held_frames = 0;
++        held_frames++;
++        if (held_frames == 1) step = kTapStep;
++        else if (held_frames <= kRepeatDelay) step = 0;
++        else if (held_frames <= kRepeatDelay + 30) step = 3;
++        else step = 6;
++    } else {
++        held_frames = 0;
++    }
++    last_px = px;
++    last_py = py;
++
++    const int tx = dx + px * step, ty = dy + py * step;
++    if (tx || ty) {
++        sio_set_mouse_motion(tx, ty);
++        motion_x += tx;
++        motion_y += ty;
++    }
++
++    /* Input diagnostics: one line per 5 s with activity. */
++    if (++frames >= 300) {
++        if (motion_x || motion_y || clicks || touches)
++            std::fprintf(stderr, "[ps5] mouse 5s: motion %+d,%+d  clicks %d  touches %d\n",
++                         motion_x, motion_y, clicks, touches);
++        motion_x = motion_y = clicks = touches = frames = 0;
++    }
++}
++#endif
++
+ #ifdef _WIN32
+ #ifndef WIN32_LEAN_AND_MEAN
+ #define WIN32_LEAN_AND_MEAN
+@@ -3002,6 +3778,9 @@ static std::filesystem::path find_upward(std::filesystem::path start,
+ // authoritative source (independent of argv[0], which can be relative/bare and
+ // would otherwise get resolved against cwd by fs::absolute). $APPIMAGE and
+ // argv[0] are non-Windows / fallback sources only.
++#if defined(__PROSPERO__)
++extern "C" const char* psx_ps5_data_dir(void);
++#endif
+ static std::filesystem::path exe_dir_from_argv(const char* argv0) {
+     namespace fs = std::filesystem;
+     std::error_code ec;
+@@ -3014,6 +3793,11 @@ static std::filesystem::path exe_dir_from_argv(const char* argv0) {
+         storage && storage[0])
+         return fs::path(storage);
+ #endif
++#if defined(__PROSPERO__)
++    /* PS5: the title folder is read-only and argv[0] is meaningless; the data
++     * folder (ps5_platform.c) holds bios/, mods/, settings and saves. */
++    return fs::path(psx_ps5_data_dir());
++#endif
+ #ifdef _WIN32
+     // Authoritative: the real image path, regardless of how we were invoked.
+     {
+@@ -3998,8 +4782,17 @@ static void apply_present_cadence(void) {
+         gl_renderer_set_swap_interval(interval);
+     if (g_vk_active)
+         vk_renderer_set_present_mode(interval);
+-    if (sdl_renderer)
++    if (sdl_renderer) {
++#if defined(__PROSPERO__)
++        /* PS5: the video driver's flip already waits for vblank. SDL's software
++         * renderer has no vsync of its own and would *simulate* it with a
++         * second 16 ms sleep after that wait: two waits per frame, a hard 30 fps
++         * lock (PPSA77066 B4/B5 logs: 30.0 fps, 0.50x for 40+ minutes). */
++        (void)SDL_RenderSetVSync(sdl_renderer, 0);
++#else
+         (void)SDL_RenderSetVSync(sdl_renderer, interval != 0 ? 1 : 0);
++#endif
++    }
+     latency_ring_set_present_mode(interval);
+ #endif
+ }
+@@ -8260,6 +9053,9 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
+                                  &g_runtime_perf.provider_poll_ticks);
+     }
+ 
++#if defined(__PROSPERO__) && !defined(PSX_SDL3)
++    ps5_controller_frame(g_port1_mouse);
++#endif
+ #if defined(__ANDROID__)
+     android_perf_hint_frame();
+     if (g_port1_mouse) android_dpad_drive_mouse();
+@@ -9121,10 +9917,21 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
+     /* Always clear black: hot-path RenderClear used to inherit the backend
+      * default draw color (often white), so letterbox margins under short FMV
+      * bands flashed as a bright strip on some X11 SDL drivers. */
++#if defined(__PROSPERO__) && !defined(PSX_SDL3)
++    /* PS5: hand the frame to the async present thread (see
++     * ps5_present_submit); the SDL renderer path below is skipped. The OSD
++     * (message text, volume bar) is composited by the present thread. */
++    const bool ps5_async = ps5_present_submit(sdl_pixel_buf, src_w, src_h, dst,
++                                              g_logical_w, 480 * tex_scale);
++#else
++    const bool ps5_async = false;
++#endif
++    if (!ps5_async) {
+     SDL_SetRenderDrawColor(sdl_renderer, 0, 0, 0, 255);
+     SDL_RenderClear(sdl_renderer);
+     SDL_RenderCopy(sdl_renderer, sdl_texture, &src, &dst);
+     host_osd_draw_sdl(sdl_renderer);
++    }
+     /* Fulfil a staged present_shot here: after RenderCopy + OSD, before
+      * RenderPresent, the renderer holds exactly the composed frame the player
+      * sees — including the logical-size aspect fit that every buffer-level
+@@ -9201,12 +10008,16 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
+     {
+         latency_ring_mark(LAT_SWAP_BEGIN);
+         const Uint64 t0 = SDL_GetPerformanceCounter();
+-        SDL_RenderPresent(sdl_renderer);
++        if (!ps5_async)
++            SDL_RenderPresent(sdl_renderer);
+         const Uint64 t1 = SDL_GetPerformanceCounter();
+         latency_ring_mark(LAT_SWAP_END);
+         netplay_note_present();
+         const Uint64 freq = SDL_GetPerformanceFrequency();
+         const Uint64 present_ms = (t1 >= t0 && freq) ? ((t1 - t0) * 1000u) / freq : 0;
++#if defined(__PROSPERO__) && !defined(PSX_SDL3)
++        ps5_note_present(t1 - t0, freq);
++#endif
+         if (!g_present_vsync_disabled && present_ms > 250) {
+             g_present_slow_count++;
+             if (g_present_slow_count >= 3 &&
+@@ -14828,7 +15639,14 @@ namespace {
+ }  // namespace
+ #endif
+ 
++#if defined(__PROSPERO__)
++extern "C" void psx_ps5_startup(int* argc, char*** argv);
++#endif
+ int main(int argc, char** argv) {
++#if defined(__PROSPERO__)
++    /* PS5: data folder, log file, splash screen, default arguments. */
++    psx_ps5_startup(&argc, &argv);
++#endif
+ #if defined(__ANDROID__)
+     android_route_stdio_to_logcat();
+     /* Work from the app's files folder. The process starts in "/", where
+@@ -15289,6 +16107,12 @@ int main(int argc, char** argv) {
+                 g_video_win_w = gc.runtime.video_window_width;
+             }
+             g_video_aa         = gc.runtime.video_antialiasing;
++#if defined(__PROSPERO__)
++            /* PS5: SDL's software renderer does linear scaling per pixel in
++             * plain C (~1.5 Mpix/frame to 1080p); nearest takes its fast
++             * path. Measured cost in the [ps5] frame time log. */
++            g_video_aa         = false;
++#endif
+             g_video_texfilter  = gc.runtime.video_texture_filter;
+             g_video_fmv_filter = gc.runtime.video_fmv_filter;
+             g_video_geometry_correction   =
+@@ -17703,7 +18527,7 @@ session_reboot:
+         std::fprintf(stdout, "psxrecomp: SPU float-shadow enabled (verified-enhancement)\n");
+     spu_init();
+     cdrom_init(disc_path_str.empty() ? NULL : disc_path_str.c_str());
+-#if defined(__ANDROID__)
++#if defined(__ANDROID__) || (defined(__PROSPERO__) && !defined(PSX_SDL3))
+     /* Disc roster for the pad menu's "Change disc": every disc of the set,
+      * resolved exactly like the boot disc (resolve_selected_disc + normalize).
+      * The disc that just booted keeps its mounted path (it may be a mod's
+@@ -17997,7 +18821,13 @@ session_reboot:
+         want.freq = g_audio_freq;
+         want.format = AUDIO_S16SYS;
+         want.channels = 2;
++#if defined(__PROSPERO__)
++        /* PS5: sceAudioOutOutput blocks per buffer; a 2048-sample buffer
++         * (~43 ms) rides out short frame hitches without underrunning. */
++        want.samples = 2048;
++#else
+         want.samples = 1024;
++#endif
+         const bool legacy = audio_legacy_mode();
+         want.allow_frequency_change = legacy ? 0 : 1;
+         if (!legacy)
+@@ -18049,8 +18879,11 @@ session_reboot:
+      * borderless desktop fullscreen (keeps the desktop resolution, letterboxes
+      * the image), 2 = exclusive fullscreen (real display-mode change), 0 =
+      * windowed. Matches the in-game Alt+Enter / Cmd+Ctrl+F hotkey behaviour. */
+-#if defined(__ANDROID__)
+-    /* An Android window always covers the screen. Opening it "windowed" makes
++#if defined(__ANDROID__) || defined(__PROSPERO__)
++    /* PS5: SDL's PS5 video driver centres a smaller window unscaled inside
++     * the TV framebuffer; desktop-fullscreen sizes the window to the display
++     * so the present path letterboxes the picture to fill it.
++     * An Android window always covers the screen. Opening it "windowed" makes
+      * SDL's Activity show the status and navigation bars over the picture;
+      * fullscreen hides them (immersive) and gives the present path the whole
+      * display to letterbox into. g_fullscreen stays 0 so the desktop
+@@ -18229,6 +19062,14 @@ session_reboot:
+     sdl_renderer = SDL_CreateRenderer(sdl_window, -1, rflags);
+     if (!sdl_renderer)
+         sdl_renderer = SDL_CreateRenderer(sdl_window, -1, SDL_RENDERER_ACCELERATED);
++    /* PS5 homebrew SDL2 (and other framebuffer-only backends) offer only
++     * SDL's software renderer, which never matches ACCELERATED; take
++     * whatever renderer exists rather than refusing to start. */
++    if (!sdl_renderer) {
++        std::fprintf(stderr, "psxrecomp: no accelerated SDL renderer (%s); using any\n",
++                     SDL_GetError());
++        sdl_renderer = SDL_CreateRenderer(sdl_window, -1, 0);
++    }
+     if (!sdl_renderer) {
+         std::fprintf(stderr, "SDL_CreateRenderer failed: %s\n", SDL_GetError());
+         return 1;
+diff --git a/runtime/src/ps5_platform.c b/runtime/src/ps5_platform.c
+new file mode 100644
+index 0000000..989e7d1
+--- /dev/null
++++ b/runtime/src/ps5_platform.c
+@@ -0,0 +1,197 @@
++/*
++ * ps5_platform.c -- PS5 homebrew startup (native PPSA title or payload).
++ *
++ * Called first thing from main() on __PROSPERO__. A PS5 title starts with no
++ * usable working directory, no console and the system splash screen up, so:
++ *   - make the per-game data folder (PSX_PS5_DATA_DIR) and work from it
++ *     (chdir() is refused in a fake-signed title; app_shims.c then provides a
++ *     virtual one through ps5_set_virtual_cwd()),
++ *   - send stdout/stderr to <data>/psx_ps5.log (truncated each launch),
++ *   - write the game's default game.toml / .cue files there if missing,
++ *   - hide the splash screen,
++ *   - and, when launched without arguments (always, for a home-screen title),
++ *     supply --game/--disc/--renderer software/--no-launcher.
++ */
++#if defined(__PROSPERO__)
++
++#include <errno.h>
++#include <fcntl.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++#ifndef PSX_PS5_DATA_DIR
++#define PSX_PS5_DATA_DIR "/data/psxrecomp"
++#endif
++
++int sceSystemServiceHideSplashScreen(void);
++int sceSystemServiceLoadExec(const char* path, const char* const* argv);
++
++/* Returning from main() in a native title ends in an exit call the system
++ * rejects (SIGSYS, PPSA77066 B2). Registered first, this runs last among the
++ * atexit handlers and hands the app back to the shell, like the PS5 SDL2
++ * port's own main() wrapper does. */
++static void ps5_exit_to_shell(void) {
++    fflush(stdout);
++    fflush(stderr);
++    sceSystemServiceLoadExec("exit", NULL);
++}
++
++/* Native-title build only (ps5/app_shims.c). */
++void ps5_set_virtual_cwd(const char* abs_dir) __attribute__((weak));
++
++/* Provided by the game's PS5 glue: files to create in the data folder when
++ * absent (NULL-terminated name/contents pairs), and the disc to boot. */
++extern const char* const psx_ps5_default_files[] __attribute__((weak));
++extern const char* const psx_ps5_boot_disc __attribute__((weak));
++
++/* Binary files to create when absent (bundled OpenBIOS). Terminated by a
++ * NULL name. */
++struct psx_ps5_blob { const char* name; const unsigned char* data; unsigned long size; };
++extern const struct psx_ps5_blob psx_ps5_default_blobs[] __attribute__((weak));
++
++static char s_data_dir[256];
++
++const char* psx_ps5_data_dir(void) {
++    return s_data_dir[0] ? s_data_dir : PSX_PS5_DATA_DIR;
++}
++
++static int file_exists(const char* p) {
++    struct stat st;
++    return stat(p, &st) == 0;
++}
++
++static void mkdirs(const char* path) {
++    char tmp[256];
++    size_t n = strlen(path);
++    if (n >= sizeof(tmp))
++        return;
++    memcpy(tmp, path, n + 1);
++    for (char* p = tmp + 1; *p; p++) {
++        if (*p == '/') {
++            *p = '\0';
++            mkdir(tmp, 0777);
++            *p = '/';
++        }
++    }
++    mkdir(tmp, 0777);
++}
++
++static void write_blob(const char* name, const void* data, size_t size) {
++    char path[512];
++    snprintf(path, sizeof(path), "%s/%s", s_data_dir, name);
++    struct stat st;
++    if (stat(path, &st) == 0 && (size_t)st.st_size == size)
++        return;
++    char dir[512];
++    snprintf(dir, sizeof(dir), "%s", path);
++    char* slash = strrchr(dir, '/');
++    if (slash) {
++        *slash = '\0';
++        mkdirs(dir);
++    }
++    FILE* out = fopen(path, "wb");
++    if (!out || fwrite(data, 1, size, out) != size) {
++        fprintf(stderr, "[ps5] cannot write %s: %s\n", path, strerror(errno));
++        if (out)
++            fclose(out);
++        return;
++    }
++    fclose(out);
++    fprintf(stderr, "[ps5] wrote %s (%lu bytes)\n", path, (unsigned long)size);
++}
++
++static void write_default_files(void) {
++    if (&psx_ps5_default_blobs)
++        for (const struct psx_ps5_blob* b = psx_ps5_default_blobs; b->name; b++)
++            write_blob(b->name, b->data, b->size);
++    if (!&psx_ps5_default_files)
++        return;
++    for (const char* const* f = psx_ps5_default_files; f[0] && f[1]; f += 2) {
++        char path[512];
++        snprintf(path, sizeof(path), "%s/%s", s_data_dir, f[0]);
++        if (file_exists(path))
++            continue;
++        char dir[512];
++        snprintf(dir, sizeof(dir), "%s", path);
++        char* slash = strrchr(dir, '/');
++        if (slash) {
++            *slash = '\0';
++            mkdirs(dir);
++        }
++        FILE* out = fopen(path, "wb");
++        if (!out) {
++            fprintf(stderr, "[ps5] cannot create %s: %s\n", path, strerror(errno));
++            continue;
++        }
++        fputs(f[1], out);
++        fclose(out);
++        fprintf(stderr, "[ps5] wrote default %s\n", path);
++    }
++}
++
++void psx_ps5_startup(int* argc, char*** argv) {
++    atexit(ps5_exit_to_shell);
++    snprintf(s_data_dir, sizeof(s_data_dir), "%s", PSX_PS5_DATA_DIR);
++    mkdirs(s_data_dir);
++
++    char log_path[300];
++    snprintf(log_path, sizeof(log_path), "%s/psx_ps5.log", s_data_dir);
++    /* Both streams into the log. dup2() onto stdout's descriptor did not
++     * carry stdout (printf) into the file on the console (B3 log had only
++     * stderr lines), so reopen each stream; append mode keeps the two
++     * writers from overwriting each other. */
++    FILE* trunc = fopen(log_path, "w");
++    if (trunc)
++        fclose(trunc);
++    if (freopen(log_path, "a", stderr))
++        setvbuf(stderr, NULL, _IOLBF, BUFSIZ);
++    if (freopen(log_path, "a", stdout))
++        setvbuf(stdout, NULL, _IOLBF, BUFSIZ);
++    fprintf(stderr, "[ps5] psxrecomp starting; data folder %s\n", s_data_dir);
++
++    if (chdir(s_data_dir) != 0) {
++        fprintf(stderr, "[ps5] chdir(%s): %s%s\n", s_data_dir, strerror(errno),
++                ps5_set_virtual_cwd ? " (using virtual cwd)" : "");
++        if (ps5_set_virtual_cwd)
++            ps5_set_virtual_cwd(s_data_dir);
++    }
++    mkdirs("saves");
++    /* No /tmp for a title: std::filesystem::temp_directory_path() (the mod
++     * media cache) throws without TMPDIR pointing at a real folder. */
++    char tmp_dir[300];
++    snprintf(tmp_dir, sizeof(tmp_dir), "%s/tmp", s_data_dir);
++    mkdirs(tmp_dir);
++    setenv("TMPDIR", tmp_dir, 1);
++    /* FPS readout (on-screen status + [FPS] log lines) and the engine's
++     * per-section timing were on by default during bring-up; both are off now
++     * (B8: steady 60 fps). Options + L3 shows the readout; setting
++     * PSX_RUNTIME_PERF_DIAG=1 here brings the timing back. */
++    write_default_files();
++
++    sceSystemServiceHideSplashScreen();
++
++    if (*argc > 1)
++        return; /* payload launched with explicit arguments */
++    static char* args[16];
++    int n = 0;
++    args[n++] = (*argc > 0 && (*argv)[0]) ? (*argv)[0] : (char*)"psx-runtime";
++    args[n++] = (char*)"--game";
++    args[n++] = (char*)"game.toml";
++    if (&psx_ps5_boot_disc && psx_ps5_boot_disc) {
++        args[n++] = (char*)"--disc";
++        args[n++] = (char*)psx_ps5_boot_disc;
++    }
++    args[n++] = (char*)"--renderer";
++    args[n++] = (char*)"software";
++    args[n++] = (char*)"--no-launcher";
++    args[n] = NULL;
++    *argc = n;
++    *argv = args;
++    if (&psx_ps5_boot_disc && psx_ps5_boot_disc && !file_exists(psx_ps5_boot_disc))
++        fprintf(stderr, "[ps5] disc image missing: %s/%s\n", s_data_dir, psx_ps5_boot_disc);
++}
++
++#endif /* __PROSPERO__ */
+diff --git a/runtime/src/psx_fiber.c b/runtime/src/psx_fiber.c
+index 7eb054d..311b0a2 100644
+--- a/runtime/src/psx_fiber.c
++++ b/runtime/src/psx_fiber.c
+@@ -34,7 +34,7 @@ psx_fiber_t psx_fiber_create(size_t stack_size, psx_fiber_entry entry, void* arg
+ void psx_fiber_switch(psx_fiber_t target) { SwitchToFiber((LPVOID)target); }
+ void psx_fiber_destroy(psx_fiber_t fiber) { if (fiber) DeleteFiber((LPVOID)fiber); }
+ 
+-#elif defined(__ANDROID__)
++#elif defined(__ANDROID__) || defined(__PROSPERO__)
+ 
+ /* Android's bionic libc does not provide the ucontext switching API. The
+  * Android runtime uses the deterministic HLE scheduler, which does not create
+diff --git a/runtime/src/traps.c b/runtime/src/traps.c
+index ca23436..1eaa7cd 100644
+--- a/runtime/src/traps.c
++++ b/runtime/src/traps.c
+@@ -766,9 +766,10 @@ int psx_hle_scheduler_enabled(void)
+ {
+     static int s_mode = -1;
+     if (s_mode < 0) {
+-#if defined(__ANDROID__)
+-        /* Android bionic has no ucontext fiber backend; always use the
+-         * deterministic scheduler rather than the legacy host-fiber bridge. */
++#if defined(__ANDROID__) || defined(__PROSPERO__)
++        /* Android bionic has no ucontext fiber backend (and a PS5 title should
++         * not depend on the system libc's); always use the deterministic
++         * scheduler rather than the legacy host-fiber bridge. */
+         s_mode = 1;
+ #else
+         const char* e = getenv("PSX_HLE_SCHEDULER");
+diff --git a/tools/ps5-sdl2-psxrecomp.patch b/tools/ps5-sdl2-psxrecomp.patch
+new file mode 100644
+index 0000000..3e97ec1
+--- /dev/null
++++ b/tools/ps5-sdl2-psxrecomp.patch
+@@ -0,0 +1,385 @@
++diff --git a/src/joystick/ps5/SDL_ps5joystick.c b/src/joystick/ps5/SDL_ps5joystick.c
++index 4cf0a15..bf0453b 100644
++--- a/src/joystick/ps5/SDL_ps5joystick.c
+++++ b/src/joystick/ps5/SDL_ps5joystick.c
++@@ -365,6 +365,9 @@ static int PS5_JoystickOpen(SDL_Joystick *joystick, int device_index)
++         return SDL_SetError("scePadSetVibration: 0x%08x", err);
++     }
++ 
+++    /* psxrecomp PS5 port: gyro/accelerometer for SDL_PS5_GetPadExtra(). */
+++    (void)scePadSetMotionSensorState(ctx->handle, 1);
+++
++     joystick->nbuttons = SDL_arraysize(btn_map);
++     joystick->naxes = 6;
++     joystick->nhats = 1;
++@@ -533,6 +536,69 @@ SDL_JoystickDriver SDL_PS5_JoystickDriver = {
++     PS5_JoystickGetGamepadMapping
++ };
++ 
+++/* psxrecomp PS5 port: the raw DualSense touchpad and motion data that SDL's
+++ * joystick API does not carry here, from the state the last
+++ * SDL_JoystickUpdate() read. Index = n-th opened pad. Returns 0 on success. */
+++typedef struct SDL_PS5_PadExtra
+++{
+++    int connected;
+++    Uint32 buttons;        /* PS5_PAD_BUTTON_* bits */
+++    int fingers;           /* 0..2 */
+++    int tx[2], ty[2];      /* touch position, touchpad pixels */
+++    int tid[2];            /* finger id */
+++    float gyro[3];         /* angular velocity x/y/z, rad/s */
+++    float accel[3];
+++    Uint64 timestamp;
+++    Uint8 lx, ly, rx, ry;  /* sticks, 0..255, 128 = centre */
+++    Uint8 l2, r2;          /* analog triggers */
+++    Uint8 raw[128];        /* the PS5_PadData bytes as read (layout checks) */
+++    int raw_size;
+++} SDL_PS5_PadExtra;
+++
+++DECLSPEC int SDLCALL SDL_PS5_GetPadExtra(int index, SDL_PS5_PadExtra *out)
+++{
+++    int i, n = 0;
+++    if (!out) {
+++        return -1;
+++    }
+++    SDL_zerop(out);
+++    for (i = 0; i < PS5_MAX_USERS; i++) {
+++        const PS5_PadData *p;
+++        if (pad_ctx[i].handle < 0 || pad_ctx[i].instance_id == -1) {
+++            continue;
+++        }
+++        if (n++ != index) {
+++            continue;
+++        }
+++        p = &pad_ctx[i].pad;
+++        out->connected = 1;
+++        out->buttons = p->buttons;
+++        out->fingers = p->touch.fingers > 2 ? 2 : p->touch.fingers;
+++        for (int f = 0; f < out->fingers; f++) {
+++            out->tx[f] = p->touch.touch[f].x;
+++            out->ty[f] = p->touch.touch[f].y;
+++            out->tid[f] = p->touch.touch[f].finger;
+++        }
+++        out->gyro[0] = p->vel.x;
+++        out->gyro[1] = p->vel.y;
+++        out->gyro[2] = p->vel.z;
+++        out->accel[0] = p->acell.x;
+++        out->accel[1] = p->acell.y;
+++        out->accel[2] = p->acell.z;
+++        out->timestamp = p->timestamp;
+++        out->lx = p->leftStick.x;
+++        out->ly = p->leftStick.y;
+++        out->rx = p->rightStick.x;
+++        out->ry = p->rightStick.y;
+++        out->l2 = p->analogButtons.l2;
+++        out->r2 = p->analogButtons.r2;
+++        out->raw_size = (int)(sizeof(*p) < sizeof(out->raw) ? sizeof(*p) : sizeof(out->raw));
+++        SDL_memcpy(out->raw, p, out->raw_size);
+++        return 0;
+++    }
+++    return -1;
+++}
+++
++ #endif /* SDL_JOYSTICK_PS5 */
++ 
++ /* vi: set ts=4 sw=4 expandtab: */
++diff --git a/src/joystick/ps5/SDL_ps5joystick.h b/src/joystick/ps5/SDL_ps5joystick.h
++index cf6b3a5..7ea2507 100644
++--- a/src/joystick/ps5/SDL_ps5joystick.h
+++++ b/src/joystick/ps5/SDL_ps5joystick.h
++@@ -109,6 +109,7 @@ int scePadSetLightBar(int handle, const PS5_PadColor* color);
++ int scePadSetVibrationMode(int handle, int mode);
++ int scePadSetVibration(int handle, const PS5_PadVibration* vib);
++ int scePadClose(int handle);
+++int scePadSetMotionSensorState(int handle, int enable);
++ 
++ int sceUserServiceInitialize(void *);
++ int sceUserServiceGetLoginUserIdList(int userId[4]);
++diff --git a/src/video/ps5/SDL_ps5video.c b/src/video/ps5/SDL_ps5video.c
++index a62be0e..92e0cb1 100644
++--- a/src/video/ps5/SDL_ps5video.c
+++++ b/src/video/ps5/SDL_ps5video.c
++@@ -26,6 +26,9 @@
++ #include <errno.h>
++ 
++ #include "SDL_ps5video.h"
+++#include "SDL_timer.h"
+++#include "SDL_atomic.h"
+++#include "SDL_mutex.h"
++ #include "SDL_ps5keyboard.h"
++ #include "SDL_ps5remote.h"
++ #include "SDL_ps5osmesa.h"
++@@ -64,12 +67,37 @@ static int PS5_CreateWindowFramebuffer(_THIS, SDL_Window *window,
++     return 0;
++ }
++ 
+++/* psxrecomp PS5 port: present timing (tilemap blit vs vblank wait). */
+++static struct {
+++    Uint64 frames, blit_ticks, wait_ticks, scaled, scale_ticks;
+++    int w, h;
+++} PS5_present_stats;
+++
+++/* One flip at a time: SDL's own framebuffer present (main thread) and
+++ * SDL_PS5_PresentPixels() (a title's present thread) share both buffers. */
+++static SDL_mutex *PS5_present_mutex; /* created in PS5_VideoInit */
+++static Uint32 PS5_frame_id;
+++static void PS5_PresentLock(void) { if (PS5_present_mutex) SDL_LockMutex(PS5_present_mutex); }
+++static void PS5_PresentUnlock(void) { if (PS5_present_mutex) SDL_UnlockMutex(PS5_present_mutex); }
+++
+++DECLSPEC void SDLCALL SDL_PS5_TakePresentStats(Uint64 *frames, double *blit_ms, double *wait_ms,
+++                                               int *w, int *h)
+++{
+++    const double f = (double)SDL_GetPerformanceFrequency() / 1000.0;
+++    *frames = PS5_present_stats.frames;
+++    *blit_ms = PS5_present_stats.blit_ticks / f;
+++    *wait_ms = PS5_present_stats.wait_ticks / f;
+++    *w = PS5_present_stats.w;
+++    *h = PS5_present_stats.h;
+++    SDL_zero(PS5_present_stats);
+++}
+++
++ static int PS5_UpdateWindowFramebuffer(_THIS, SDL_Window *window,
++                                        const SDL_Rect *rects, int numrects)
++ {
++     PS5_DeviceData *device_data = (PS5_DeviceData *)_this->driverdata;
++-    static uint32_t frame_id = 0;
++-    uint8_t idx = frame_id % 2;
+++    uint32_t frame_id;
+++    uint8_t idx;
++     SDL_Surface *surface;
++     struct kevent evt;
++     int junk;
++@@ -78,6 +106,10 @@ static int PS5_UpdateWindowFramebuffer(_THIS, SDL_Window *window,
++     if (!surface) {
++         return SDL_SetError("Couldn't find surface for window");
++     }
+++    const Uint64 t0 = SDL_GetPerformanceCounter();
+++    PS5_PresentLock();
+++    frame_id = PS5_frame_id;
+++    idx = frame_id % 2;
++ 
++     if(surface->w == device_data->surface->w &&
++        surface->h == device_data->surface->h) {
++@@ -98,14 +130,28 @@ static int PS5_UpdateWindowFramebuffer(_THIS, SDL_Window *window,
++                          (device_data->surface->h - surface->h) / 2);
++     }
++ 
+++    const Uint64 t1 = SDL_GetPerformanceCounter();
++     if (sceVideoOutSubmitFlip(device_data->handle, idx, 1, frame_id)) {
+++        PS5_PresentUnlock();
++         return SDL_SetError("sceVideoOutSubmitFlip: %s", strerror(errno));
++     }
++ 
++     if (sceKernelWaitEqueue(device_data->evt_queue, &evt, 1, &junk, 0)) {
+++        PS5_PresentUnlock();
++         return SDL_SetError("sceKernelWaitEqueue: %s", strerror(errno));
++     }
++-    frame_id++;
+++    PS5_frame_id = frame_id + 1;
+++    PS5_PresentUnlock();
+++    {
+++        const Uint64 t2 = SDL_GetPerformanceCounter();
+++        PS5_present_stats.frames++;
+++        PS5_present_stats.blit_ticks += t1 - t0;
+++        PS5_present_stats.wait_ticks += t2 - t1;
+++        PS5_present_stats.scaled += (surface->w != device_data->surface->w ||
+++                                     surface->h != device_data->surface->h);
+++        PS5_present_stats.w = surface->w;
+++        PS5_present_stats.h = surface->h;
+++    }
++ 
++     return 0;
++ }
++@@ -187,6 +233,9 @@ static int PS5_SetDisplayMode(_THIS, SDL_VideoDisplay * display,
++ 
++ static int PS5_VideoInit(_THIS)
++ {
+++    if (!PS5_present_mutex) {
+++        PS5_present_mutex = SDL_CreateMutex();
+++    }
++     PS5_DeviceData *device_data = (PS5_DeviceData *)_this->driverdata;
++     SDL_VideoDisplay display;
++     SDL_DisplayMode mode;
++@@ -351,6 +400,183 @@ static SDL_VideoDevice *PS5_CreateDevice(void)
++ VideoBootStrap PS5_bootstrap = { "ps5", "Sony PS5 Video Driver",
++                                  PS5_CreateDevice };
++ 
+++/* psxrecomp PS5 port: present a game frame straight into the scan-out
+++ * buffers, bypassing SDL's renderer: nearest-neighbour scale of an ARGB8888
+++ * image (red/blue swapped on the fly) into dst (screen pixels), tiled blit of
+++ * just that rectangle, flip, wait for the flip. Safe to call from a thread
+++ * other than the one that owns the SDL renderer. Returns 0 on success. */
+++/* An image composited over the frame after scaling (OSD text, volume bar):
+++ * ARGB8888, nearest-scaled into dst (screen pixels); alpha 0 = transparent. */
+++typedef struct SDL_PS5_Overlay
+++{
+++    const Uint32 *argb;
+++    int w, h;
+++    int dx, dy, dw, dh;
+++} SDL_PS5_Overlay;
+++
+++static void PS5_DrawOverlay(SDL_Surface *surf, const SDL_PS5_Overlay *o)
+++{
+++    const int dpitch = surf->pitch / 4;
+++    int x0 = o->dx, y0 = o->dy, x1 = o->dx + o->dw, y1 = o->dy + o->dh;
+++    if (!o->argb || o->w <= 0 || o->h <= 0 || o->dw <= 0 || o->dh <= 0) {
+++        return;
+++    }
+++    if (x0 < 0) x0 = 0;
+++    if (y0 < 0) y0 = 0;
+++    if (x1 > surf->w) x1 = surf->w;
+++    if (y1 > surf->h) y1 = surf->h;
+++    for (int y = y0; y < y1; y++) {
+++        const Uint32 *srow = o->argb + (size_t)(((Sint64)(y - o->dy) * o->h) / o->dh) * o->w;
+++        Uint32 *drow = (Uint32 *)surf->pixels + (size_t)y * dpitch;
+++        for (int x = x0; x < x1; x++) {
+++            const Uint32 p = srow[((Sint64)(x - o->dx) * o->w) / o->dw];
+++            if ((p >> 24) == 0) {
+++                continue;
+++            }
+++            drow[x] = (p & 0xFF00FF00u) | ((p >> 16) & 0xFFu) | ((p & 0xFFu) << 16);
+++        }
+++    }
+++}
+++
+++static int PS5_PresentPixelsImpl(const Uint32 *argb, int w, int h, int pitch_px,
+++                                 int dx, int dy, int dw, int dh,
+++                                 const SDL_PS5_Overlay *ov, int nov);
+++static int PS5_overlay_outside;
+++
+++DECLSPEC int SDLCALL SDL_PS5_PresentPixels(const Uint32 *argb, int w, int h, int pitch_px,
+++                                           int dx, int dy, int dw, int dh)
+++{
+++    return PS5_PresentPixelsImpl(argb, w, h, pitch_px, dx, dy, dw, dh, NULL, 0);
+++}
+++
+++DECLSPEC int SDLCALL SDL_PS5_PresentPixelsOverlay(const Uint32 *argb, int w, int h, int pitch_px,
+++                                                  int dx, int dy, int dw, int dh,
+++                                                  const SDL_PS5_Overlay *ov, int nov)
+++{
+++    return PS5_PresentPixelsImpl(argb, w, h, pitch_px, dx, dy, dw, dh, ov, nov);
+++}
+++
+++static int PS5_PresentPixelsImpl(const Uint32 *argb, int w, int h, int pitch_px,
+++                                 int dx, int dy, int dw, int dh,
+++                                 const SDL_PS5_Overlay *ov, int nov)
+++{
+++    SDL_VideoDevice *dev = SDL_GetVideoDevice();
+++    PS5_DeviceData *dd;
+++    SDL_Surface *surf;
+++    static int *xmap = NULL;
+++    static int xmap_w = 0, xmap_dw = 0;
+++    static SDL_Rect last = { 0, 0, 0, 0 };
+++    SDL_Rect damage, full;
+++    struct kevent evt;
+++    int junk, y, idx;
+++    Uint64 t0, t1, t2, t3;
+++
+++    if (!dev || !dev->driverdata || !argb || w <= 0 || h <= 0) {
+++        return -1;
+++    }
+++    dd = (PS5_DeviceData *)dev->driverdata;
+++    surf = dd->surface;
+++    if (!surf) {
+++        return -1;
+++    }
+++    full.x = 0; full.y = 0; full.w = surf->w; full.h = surf->h;
+++    /* Clip the destination to the screen. */
+++    if (dx < 0) { dw += dx; dx = 0; }
+++    if (dy < 0) { dh += dy; dy = 0; }
+++    if (dx + dw > surf->w) dw = surf->w - dx;
+++    if (dy + dh > surf->h) dh = surf->h - dy;
+++    if (dw <= 0 || dh <= 0) {
+++        return -1;
+++    }
+++
+++    t0 = SDL_GetPerformanceCounter();
+++    PS5_PresentLock();
+++    if (xmap_w != w || xmap_dw != dw) {
+++        int *nx = (int *)SDL_realloc(xmap, sizeof(int) * dw);
+++        if (!nx) {
+++            PS5_PresentUnlock();
+++            return -1;
+++        }
+++        xmap = nx;
+++        for (int x = 0; x < dw; x++) {
+++            xmap[x] = (int)(((Sint64)x * w) / dw);
+++        }
+++        xmap_w = w;
+++        xmap_dw = dw;
+++    }
+++    if (last.x != dx || last.y != dy || last.w != dw || last.h != dh || PS5_overlay_outside) {
+++        /* Geometry changed, or an overlay drew outside the frame last time:
+++         * black out the whole screen once. */
+++        PS5_overlay_outside = 0;
+++        SDL_memset(surf->pixels, 0, (size_t)surf->pitch * surf->h);
+++        damage = full;
+++        last.x = dx; last.y = dy; last.w = dw; last.h = dh;
+++    } else {
+++        damage = last;
+++    }
+++    {
+++        const int dpitch = surf->pitch / 4;
+++        Uint32 *dbase = (Uint32 *)surf->pixels + (size_t)dy * dpitch + dx;
+++        int prev_sy = -1;
+++        Uint32 *prev_row = NULL;
+++        for (y = 0; y < dh; y++) {
+++            const int sy = (int)(((Sint64)y * h) / dh);
+++            Uint32 *drow = dbase + (size_t)y * dpitch;
+++            if (sy == prev_sy && prev_row) {
+++                SDL_memcpy(drow, prev_row, sizeof(Uint32) * dw);
+++            } else {
+++                const Uint32 *srow = argb + (size_t)sy * pitch_px;
+++                for (int x = 0; x < dw; x++) {
+++                    const Uint32 p = srow[xmap[x]];
+++                    drow[x] = (p & 0xFF00FF00u) | ((p >> 16) & 0xFFu) | ((p & 0xFFu) << 16);
+++                }
+++            }
+++            prev_sy = sy;
+++            prev_row = drow;
+++        }
+++    }
+++    /* Overlays sit inside the frame's rectangle (the next frame repaints it
+++     * when they go away); one reaching outside widens this frame's damage. */
+++    for (int i = 0; i < nov; i++) {
+++        SDL_Rect r;
+++        PS5_DrawOverlay(surf, &ov[i]);
+++        r.x = ov[i].dx; r.y = ov[i].dy; r.w = ov[i].dw; r.h = ov[i].dh;
+++        if (SDL_IntersectRect(&r, &full, &r)) {
+++            SDL_Rect in;
+++            SDL_UnionRect(&damage, &r, &damage);
+++            if (!SDL_IntersectRect(&r, &last, &in) || !SDL_RectEquals(&in, &r)) {
+++                PS5_overlay_outside = 1;
+++            }
+++        }
+++    }
+++    t1 = SDL_GetPerformanceCounter();
+++    idx = PS5_frame_id % 2;
+++    PS5_Tilemap_Blit(dd->tmap, surf->pixels, surf->pitch / 4, dd->vbuf[idx].data, idx,
+++                     &damage, 1, 0, 0);
+++    t2 = SDL_GetPerformanceCounter();
+++    if (sceVideoOutSubmitFlip(dd->handle, idx, 1, PS5_frame_id) ||
+++        sceKernelWaitEqueue(dd->evt_queue, &evt, 1, &junk, 0)) {
+++        PS5_PresentUnlock();
+++        return -1;
+++    }
+++    PS5_frame_id++;
+++    t3 = SDL_GetPerformanceCounter();
+++    PS5_present_stats.frames++;
+++    PS5_present_stats.scale_ticks += t1 - t0;
+++    PS5_present_stats.blit_ticks += t2 - t1;
+++    PS5_present_stats.wait_ticks += t3 - t2;
+++    PS5_present_stats.w = dw;
+++    PS5_present_stats.h = dh;
+++    PS5_PresentUnlock();
+++    return 0;
+++}
+++
+++DECLSPEC double SDLCALL SDL_PS5_TakeScaleMs(void)
+++{
+++    /* Called right before SDL_PS5_TakePresentStats(), which resets it. */
+++    return PS5_present_stats.scale_ticks / ((double)SDL_GetPerformanceFrequency() / 1000.0);
+++}
+++
++ #endif /* SDL_VIDEO_DRIVER_PS5 */
++ 
++ /* vi: set ts=4 sw=4 expandtab: */

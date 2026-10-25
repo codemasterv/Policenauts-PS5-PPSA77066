@@ -1,0 +1,3 @@
+ee4c47dc0d617b3bc8f35108f9956baf228a1322 ps5: do not create a joystick for CEC remote
+https://github.com/ps5-payload-dev/SDL.git
+release-2.30.x-ps5

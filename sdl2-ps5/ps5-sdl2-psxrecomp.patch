@@ -1,0 +1,385 @@
+diff --git a/src/joystick/ps5/SDL_ps5joystick.c b/src/joystick/ps5/SDL_ps5joystick.c
+index 4cf0a15..bf0453b 100644
+--- a/src/joystick/ps5/SDL_ps5joystick.c
++++ b/src/joystick/ps5/SDL_ps5joystick.c
+@@ -365,6 +365,9 @@ static int PS5_JoystickOpen(SDL_Joystick *joystick, int device_index)
+         return SDL_SetError("scePadSetVibration: 0x%08x", err);
+     }
+ 
++    /* psxrecomp PS5 port: gyro/accelerometer for SDL_PS5_GetPadExtra(). */
++    (void)scePadSetMotionSensorState(ctx->handle, 1);
++
+     joystick->nbuttons = SDL_arraysize(btn_map);
+     joystick->naxes = 6;
+     joystick->nhats = 1;
+@@ -533,6 +536,69 @@ SDL_JoystickDriver SDL_PS5_JoystickDriver = {
+     PS5_JoystickGetGamepadMapping
+ };
+ 
++/* psxrecomp PS5 port: the raw DualSense touchpad and motion data that SDL's
++ * joystick API does not carry here, from the state the last
++ * SDL_JoystickUpdate() read. Index = n-th opened pad. Returns 0 on success. */
++typedef struct SDL_PS5_PadExtra
++{
++    int connected;
++    Uint32 buttons;        /* PS5_PAD_BUTTON_* bits */
++    int fingers;           /* 0..2 */
++    int tx[2], ty[2];      /* touch position, touchpad pixels */
++    int tid[2];            /* finger id */
++    float gyro[3];         /* angular velocity x/y/z, rad/s */
++    float accel[3];
++    Uint64 timestamp;
++    Uint8 lx, ly, rx, ry;  /* sticks, 0..255, 128 = centre */
++    Uint8 l2, r2;          /* analog triggers */
++    Uint8 raw[128];        /* the PS5_PadData bytes as read (layout checks) */
++    int raw_size;
++} SDL_PS5_PadExtra;
++
++DECLSPEC int SDLCALL SDL_PS5_GetPadExtra(int index, SDL_PS5_PadExtra *out)
++{
++    int i, n = 0;
++    if (!out) {
++        return -1;
++    }
++    SDL_zerop(out);
++    for (i = 0; i < PS5_MAX_USERS; i++) {
++        const PS5_PadData *p;
++        if (pad_ctx[i].handle < 0 || pad_ctx[i].instance_id == -1) {
++            continue;
++        }
++        if (n++ != index) {
++            continue;
++        }
++        p = &pad_ctx[i].pad;
++        out->connected = 1;
++        out->buttons = p->buttons;
++        out->fingers = p->touch.fingers > 2 ? 2 : p->touch.fingers;
++        for (int f = 0; f < out->fingers; f++) {
++            out->tx[f] = p->touch.touch[f].x;
++            out->ty[f] = p->touch.touch[f].y;
++            out->tid[f] = p->touch.touch[f].finger;
++        }
++        out->gyro[0] = p->vel.x;
++        out->gyro[1] = p->vel.y;
++        out->gyro[2] = p->vel.z;
++        out->accel[0] = p->acell.x;
++        out->accel[1] = p->acell.y;
++        out->accel[2] = p->acell.z;
++        out->timestamp = p->timestamp;
++        out->lx = p->leftStick.x;
++        out->ly = p->leftStick.y;
++        out->rx = p->rightStick.x;
++        out->ry = p->rightStick.y;
++        out->l2 = p->analogButtons.l2;
++        out->r2 = p->analogButtons.r2;
++        out->raw_size = (int)(sizeof(*p) < sizeof(out->raw) ? sizeof(*p) : sizeof(out->raw));
++        SDL_memcpy(out->raw, p, out->raw_size);
++        return 0;
++    }
++    return -1;
++}
++
+ #endif /* SDL_JOYSTICK_PS5 */
+ 
+ /* vi: set ts=4 sw=4 expandtab: */
+diff --git a/src/joystick/ps5/SDL_ps5joystick.h b/src/joystick/ps5/SDL_ps5joystick.h
+index cf6b3a5..7ea2507 100644
+--- a/src/joystick/ps5/SDL_ps5joystick.h
++++ b/src/joystick/ps5/SDL_ps5joystick.h
+@@ -109,6 +109,7 @@ int scePadSetLightBar(int handle, const PS5_PadColor* color);
+ int scePadSetVibrationMode(int handle, int mode);
+ int scePadSetVibration(int handle, const PS5_PadVibration* vib);
+ int scePadClose(int handle);
++int scePadSetMotionSensorState(int handle, int enable);
+ 
+ int sceUserServiceInitialize(void *);
+ int sceUserServiceGetLoginUserIdList(int userId[4]);
+diff --git a/src/video/ps5/SDL_ps5video.c b/src/video/ps5/SDL_ps5video.c
+index a62be0e..92e0cb1 100644
+--- a/src/video/ps5/SDL_ps5video.c
++++ b/src/video/ps5/SDL_ps5video.c
+@@ -26,6 +26,9 @@
+ #include <errno.h>
+ 
+ #include "SDL_ps5video.h"
++#include "SDL_timer.h"
++#include "SDL_atomic.h"
++#include "SDL_mutex.h"
+ #include "SDL_ps5keyboard.h"
+ #include "SDL_ps5remote.h"
+ #include "SDL_ps5osmesa.h"
+@@ -64,12 +67,37 @@ static int PS5_CreateWindowFramebuffer(_THIS, SDL_Window *window,
+     return 0;
+ }
+ 
++/* psxrecomp PS5 port: present timing (tilemap blit vs vblank wait). */
++static struct {
++    Uint64 frames, blit_ticks, wait_ticks, scaled, scale_ticks;
++    int w, h;
++} PS5_present_stats;
++
++/* One flip at a time: SDL's own framebuffer present (main thread) and
++ * SDL_PS5_PresentPixels() (a title's present thread) share both buffers. */
++static SDL_mutex *PS5_present_mutex; /* created in PS5_VideoInit */
++static Uint32 PS5_frame_id;
++static void PS5_PresentLock(void) { if (PS5_present_mutex) SDL_LockMutex(PS5_present_mutex); }
++static void PS5_PresentUnlock(void) { if (PS5_present_mutex) SDL_UnlockMutex(PS5_present_mutex); }
++
++DECLSPEC void SDLCALL SDL_PS5_TakePresentStats(Uint64 *frames, double *blit_ms, double *wait_ms,
++                                               int *w, int *h)
++{
++    const double f = (double)SDL_GetPerformanceFrequency() / 1000.0;
++    *frames = PS5_present_stats.frames;
++    *blit_ms = PS5_present_stats.blit_ticks / f;
++    *wait_ms = PS5_present_stats.wait_ticks / f;
++    *w = PS5_present_stats.w;
++    *h = PS5_present_stats.h;
++    SDL_zero(PS5_present_stats);
++}
++
+ static int PS5_UpdateWindowFramebuffer(_THIS, SDL_Window *window,
+                                        const SDL_Rect *rects, int numrects)
+ {
+     PS5_DeviceData *device_data = (PS5_DeviceData *)_this->driverdata;
+-    static uint32_t frame_id = 0;
+-    uint8_t idx = frame_id % 2;
++    uint32_t frame_id;
++    uint8_t idx;
+     SDL_Surface *surface;
+     struct kevent evt;
+     int junk;
+@@ -78,6 +106,10 @@ static int PS5_UpdateWindowFramebuffer(_THIS, SDL_Window *window,
+     if (!surface) {
+         return SDL_SetError("Couldn't find surface for window");
+     }
++    const Uint64 t0 = SDL_GetPerformanceCounter();
++    PS5_PresentLock();
++    frame_id = PS5_frame_id;
++    idx = frame_id % 2;
+ 
+     if(surface->w == device_data->surface->w &&
+        surface->h == device_data->surface->h) {
+@@ -98,14 +130,28 @@ static int PS5_UpdateWindowFramebuffer(_THIS, SDL_Window *window,
+                          (device_data->surface->h - surface->h) / 2);
+     }
+ 
++    const Uint64 t1 = SDL_GetPerformanceCounter();
+     if (sceVideoOutSubmitFlip(device_data->handle, idx, 1, frame_id)) {
++        PS5_PresentUnlock();
+         return SDL_SetError("sceVideoOutSubmitFlip: %s", strerror(errno));
+     }
+ 
+     if (sceKernelWaitEqueue(device_data->evt_queue, &evt, 1, &junk, 0)) {
++        PS5_PresentUnlock();
+         return SDL_SetError("sceKernelWaitEqueue: %s", strerror(errno));
+     }
+-    frame_id++;
++    PS5_frame_id = frame_id + 1;
++    PS5_PresentUnlock();
++    {
++        const Uint64 t2 = SDL_GetPerformanceCounter();
++        PS5_present_stats.frames++;
++        PS5_present_stats.blit_ticks += t1 - t0;
++        PS5_present_stats.wait_ticks += t2 - t1;
++        PS5_present_stats.scaled += (surface->w != device_data->surface->w ||
++                                     surface->h != device_data->surface->h);
++        PS5_present_stats.w = surface->w;
++        PS5_present_stats.h = surface->h;
++    }
+ 
+     return 0;
+ }
+@@ -187,6 +233,9 @@ static int PS5_SetDisplayMode(_THIS, SDL_VideoDisplay * display,
+ 
+ static int PS5_VideoInit(_THIS)
+ {
++    if (!PS5_present_mutex) {
++        PS5_present_mutex = SDL_CreateMutex();
++    }
+     PS5_DeviceData *device_data = (PS5_DeviceData *)_this->driverdata;
+     SDL_VideoDisplay display;
+     SDL_DisplayMode mode;
+@@ -351,6 +400,183 @@ static SDL_VideoDevice *PS5_CreateDevice(void)
+ VideoBootStrap PS5_bootstrap = { "ps5", "Sony PS5 Video Driver",
+                                  PS5_CreateDevice };
+ 
++/* psxrecomp PS5 port: present a game frame straight into the scan-out
++ * buffers, bypassing SDL's renderer: nearest-neighbour scale of an ARGB8888
++ * image (red/blue swapped on the fly) into dst (screen pixels), tiled blit of
++ * just that rectangle, flip, wait for the flip. Safe to call from a thread
++ * other than the one that owns the SDL renderer. Returns 0 on success. */
++/* An image composited over the frame after scaling (OSD text, volume bar):
++ * ARGB8888, nearest-scaled into dst (screen pixels); alpha 0 = transparent. */
++typedef struct SDL_PS5_Overlay
++{
++    const Uint32 *argb;
++    int w, h;
++    int dx, dy, dw, dh;
++} SDL_PS5_Overlay;
++
++static void PS5_DrawOverlay(SDL_Surface *surf, const SDL_PS5_Overlay *o)
++{
++    const int dpitch = surf->pitch / 4;
++    int x0 = o->dx, y0 = o->dy, x1 = o->dx + o->dw, y1 = o->dy + o->dh;
++    if (!o->argb || o->w <= 0 || o->h <= 0 || o->dw <= 0 || o->dh <= 0) {
++        return;
++    }
++    if (x0 < 0) x0 = 0;
++    if (y0 < 0) y0 = 0;
++    if (x1 > surf->w) x1 = surf->w;
++    if (y1 > surf->h) y1 = surf->h;
++    for (int y = y0; y < y1; y++) {
++        const Uint32 *srow = o->argb + (size_t)(((Sint64)(y - o->dy) * o->h) / o->dh) * o->w;
++        Uint32 *drow = (Uint32 *)surf->pixels + (size_t)y * dpitch;
++        for (int x = x0; x < x1; x++) {
++            const Uint32 p = srow[((Sint64)(x - o->dx) * o->w) / o->dw];
++            if ((p >> 24) == 0) {
++                continue;
++            }
++            drow[x] = (p & 0xFF00FF00u) | ((p >> 16) & 0xFFu) | ((p & 0xFFu) << 16);
++        }
++    }
++}
++
++static int PS5_PresentPixelsImpl(const Uint32 *argb, int w, int h, int pitch_px,
++                                 int dx, int dy, int dw, int dh,
++                                 const SDL_PS5_Overlay *ov, int nov);
++static int PS5_overlay_outside;
++
++DECLSPEC int SDLCALL SDL_PS5_PresentPixels(const Uint32 *argb, int w, int h, int pitch_px,
++                                           int dx, int dy, int dw, int dh)
++{
++    return PS5_PresentPixelsImpl(argb, w, h, pitch_px, dx, dy, dw, dh, NULL, 0);
++}
++
++DECLSPEC int SDLCALL SDL_PS5_PresentPixelsOverlay(const Uint32 *argb, int w, int h, int pitch_px,
++                                                  int dx, int dy, int dw, int dh,
++                                                  const SDL_PS5_Overlay *ov, int nov)
++{
++    return PS5_PresentPixelsImpl(argb, w, h, pitch_px, dx, dy, dw, dh, ov, nov);
++}
++
++static int PS5_PresentPixelsImpl(const Uint32 *argb, int w, int h, int pitch_px,
++                                 int dx, int dy, int dw, int dh,
++                                 const SDL_PS5_Overlay *ov, int nov)
++{
++    SDL_VideoDevice *dev = SDL_GetVideoDevice();
++    PS5_DeviceData *dd;
++    SDL_Surface *surf;
++    static int *xmap = NULL;
++    static int xmap_w = 0, xmap_dw = 0;
++    static SDL_Rect last = { 0, 0, 0, 0 };
++    SDL_Rect damage, full;
++    struct kevent evt;
++    int junk, y, idx;
++    Uint64 t0, t1, t2, t3;
++
++    if (!dev || !dev->driverdata || !argb || w <= 0 || h <= 0) {
++        return -1;
++    }
++    dd = (PS5_DeviceData *)dev->driverdata;
++    surf = dd->surface;
++    if (!surf) {
++        return -1;
++    }
++    full.x = 0; full.y = 0; full.w = surf->w; full.h = surf->h;
++    /* Clip the destination to the screen. */
++    if (dx < 0) { dw += dx; dx = 0; }
++    if (dy < 0) { dh += dy; dy = 0; }
++    if (dx + dw > surf->w) dw = surf->w - dx;
++    if (dy + dh > surf->h) dh = surf->h - dy;
++    if (dw <= 0 || dh <= 0) {
++        return -1;
++    }
++
++    t0 = SDL_GetPerformanceCounter();
++    PS5_PresentLock();
++    if (xmap_w != w || xmap_dw != dw) {
++        int *nx = (int *)SDL_realloc(xmap, sizeof(int) * dw);
++        if (!nx) {
++            PS5_PresentUnlock();
++            return -1;
++        }
++        xmap = nx;
++        for (int x = 0; x < dw; x++) {
++            xmap[x] = (int)(((Sint64)x * w) / dw);
++        }
++        xmap_w = w;
++        xmap_dw = dw;
++    }
++    if (last.x != dx || last.y != dy || last.w != dw || last.h != dh || PS5_overlay_outside) {
++        /* Geometry changed, or an overlay drew outside the frame last time:
++         * black out the whole screen once. */
++        PS5_overlay_outside = 0;
++        SDL_memset(surf->pixels, 0, (size_t)surf->pitch * surf->h);
++        damage = full;
++        last.x = dx; last.y = dy; last.w = dw; last.h = dh;
++    } else {
++        damage = last;
++    }
++    {
++        const int dpitch = surf->pitch / 4;
++        Uint32 *dbase = (Uint32 *)surf->pixels + (size_t)dy * dpitch + dx;
++        int prev_sy = -1;
++        Uint32 *prev_row = NULL;
++        for (y = 0; y < dh; y++) {
++            const int sy = (int)(((Sint64)y * h) / dh);
++            Uint32 *drow = dbase + (size_t)y * dpitch;
++            if (sy == prev_sy && prev_row) {
++                SDL_memcpy(drow, prev_row, sizeof(Uint32) * dw);
++            } else {
++                const Uint32 *srow = argb + (size_t)sy * pitch_px;
++                for (int x = 0; x < dw; x++) {
++                    const Uint32 p = srow[xmap[x]];
++                    drow[x] = (p & 0xFF00FF00u) | ((p >> 16) & 0xFFu) | ((p & 0xFFu) << 16);
++                }
++            }
++            prev_sy = sy;
++            prev_row = drow;
++        }
++    }
++    /* Overlays sit inside the frame's rectangle (the next frame repaints it
++     * when they go away); one reaching outside widens this frame's damage. */
++    for (int i = 0; i < nov; i++) {
++        SDL_Rect r;
++        PS5_DrawOverlay(surf, &ov[i]);
++        r.x = ov[i].dx; r.y = ov[i].dy; r.w = ov[i].dw; r.h = ov[i].dh;
++        if (SDL_IntersectRect(&r, &full, &r)) {
++            SDL_Rect in;
++            SDL_UnionRect(&damage, &r, &damage);
++            if (!SDL_IntersectRect(&r, &last, &in) || !SDL_RectEquals(&in, &r)) {
++                PS5_overlay_outside = 1;
++            }
++        }
++    }
++    t1 = SDL_GetPerformanceCounter();
++    idx = PS5_frame_id % 2;
++    PS5_Tilemap_Blit(dd->tmap, surf->pixels, surf->pitch / 4, dd->vbuf[idx].data, idx,
++                     &damage, 1, 0, 0);
++    t2 = SDL_GetPerformanceCounter();
++    if (sceVideoOutSubmitFlip(dd->handle, idx, 1, PS5_frame_id) ||
++        sceKernelWaitEqueue(dd->evt_queue, &evt, 1, &junk, 0)) {
++        PS5_PresentUnlock();
++        return -1;
++    }
++    PS5_frame_id++;
++    t3 = SDL_GetPerformanceCounter();
++    PS5_present_stats.frames++;
++    PS5_present_stats.scale_ticks += t1 - t0;
++    PS5_present_stats.blit_ticks += t2 - t1;
++    PS5_present_stats.wait_ticks += t3 - t2;
++    PS5_present_stats.w = dw;
++    PS5_present_stats.h = dh;
++    PS5_PresentUnlock();
++    return 0;
++}
++
++DECLSPEC double SDLCALL SDL_PS5_TakeScaleMs(void)
++{
++    /* Called right before SDL_PS5_TakePresentStats(), which resets it. */
++    return PS5_present_stats.scale_ticks / ((double)SDL_GetPerformanceFrequency() / 1000.0);
++}
++
+ #endif /* SDL_VIDEO_DRIVER_PS5 */
+ 
+ /* vi: set ts=4 sw=4 expandtab: */

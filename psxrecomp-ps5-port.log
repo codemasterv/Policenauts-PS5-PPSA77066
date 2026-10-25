@@ -1,0 +1,17 @@
+0c221f1 PS5 usb mouse via mousebridge payload (mailbox + request file)
+04279f1 Revert "PS5: experimental USB/Bluetooth mouse via run-time loaded libSceMouse"
+223e45f Revert "PS5 usb mouse: load libSceMouse from the sandbox path"
+84c4b82 Revert "PS5 usb mouse: try every symbol lookup route, dlsym control test"
+d22ad40 Revert "PS5 usb mouse: import libSceMouse (weak) instead of dlsym"
+4c37422 PS5 usb mouse: import libSceMouse (weak) instead of dlsym
+96f8125 PS5 usb mouse: try every symbol lookup route, dlsym control test
+a6171ff PS5 usb mouse: load libSceMouse from the sandbox path
+16acea9 PS5: experimental USB/Bluetooth mouse via run-time loaded libSceMouse
+874ca59 PS5: on-screen messages on the async present path; diagnostics off by default
+e402a3d PS5: async present thread, drop gyro, touch layout dump
+2b60999 PS5: open the controller ourselves, SDL fallback, frame-time log, nearest scaling
+9244c67 PS5: drop SDL simulated vsync, touchpad/gyro pointer, larger audio buffer
+08903c4 PS5: shortcut cooldown, FPS readout, stdout in the log
+2e3980a PS5: accept SDL's software renderer, exit to shell
+e7193a5 PS5: TMPDIR in the data folder, data folder as exe dir, bundled-file blobs
+fd79873 PS5 homebrew target (ps5-payload-sdk, SDL2)
